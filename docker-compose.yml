@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  code-executor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: code-executor:latest
+    container_name: code-executor
+    ports:
+      - "8080:8080"
+    volumes:
+      # 持久化 workspace 数据
+      - executor_workspace:/workspace
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKSPACE_DIR=/workspace
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  executor_workspace:
+    driver: local

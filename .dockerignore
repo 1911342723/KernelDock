@@ -1,0 +1,44 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Test
+.pytest_cache
+.coverage
+htmlcov/
+tests/
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Docs
+docs/
+*.md
+!README.md
+
+# Keep sandbox_runtime
+!sandbox_runtime/
+
+# Misc
+.DS_Store
+Thumbs.db
