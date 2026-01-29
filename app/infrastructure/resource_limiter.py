@@ -70,7 +70,7 @@ class ResourceLimits:
         return {
             "nano_cpus": int(self.cpu_count * 1e9),
             "mem_limit": f"{self.memory_mb}m",
-            "memswap_limit": f"{self.memory_mb}m",  # 禁用 swap
+            "memswap_limit": f"{self.memory_mb * 2}m",  # 启用 swap (1:1 ratio)
             "pids_limit": self.pids_limit,
             "storage_opt": {"size": f"{self.disk_mb}M"}
         }
@@ -95,7 +95,7 @@ class ResourceLimits:
             "cpu_period": cpu_period,
             "cpu_quota": cpu_quota,
             "mem_limit": f"{self.memory_mb}m",
-            "memswap_limit": f"{self.memory_mb}m",  # 禁用 swap
+            "memswap_limit": f"{self.memory_mb * 2}m",  # 启用 swap (1:1 ratio)
             "pids_limit": self.pids_limit,
             # 注意: storage_opt 需要特定的存储驱动支持（如 overlay2 with xfs）
             # 在不支持的环境中可能需要忽略此选项

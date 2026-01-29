@@ -1,156 +1,220 @@
-# Code Executor Service (沙箱代码执行服务)
+# Code Executor Service
 
-这是一款高性能、无状态的 Python 代码执行服务，专门为数据分析、科学计算和数据可视化场景设计。它采用 Docker + gVisor 架构，提供生产级别的安全隔离性能。
+无状态 Python 代码执行服务，用于数据分析和可视化。可替代 E2B 沙箱服务。
 
-## 🌟 核心特性
+## 功能特性
 
-- **� 零延迟启动**: 优化的沙箱池机制，秒级创建执行环境。
-- **�️ 深度安全加固**:
-  - **gVisor (runsc)**: 采用用户态内核隔离，防止容器逃逸。
-  - **AST 静态分析**: 预检代码风险，禁止危险模块（`os`, `subprocess`, `socket` 等）。
-  - **资源限制**: 严格限制 CPU、内存、磁盘和进程数（PID limit）。
-  - **网络隔离**: 默认禁用出站网络，防止数据泄漏。
-- **📊 智能数据分析**:
-  - **自动加载**: 识别并自动加载 `/data` 目录下的 CSV/Excel 文件。
-  - **图表捕获**: 自动拦截并转换 matplotlib/seaborn 图像为 SVG/Base64。
-  - **表格预览**: 支持 pandas DataFrame 分页预览。
-- **📦 内置运行时 (sandbox_runtime)**: 预装丰富的数据分析库（pandas, numpy, scikit-learn, plotly 等）。
+- 🐍 Python 代码执行（支持 pandas, numpy, matplotlib, seaborn 等）
+- 📊 自动捕获图表（SVG 格式）
+- 📋 表格数据捕获和导出
+- 📁 文件上传和下载
+- 🔄 会话管理（支持多用户）
+- 🐳 Docker 部署
 
----
+## 快速开始
 
-## 🏗️ 架构概览
-
-```
-                            [ API Client ]
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │   Code Executor (FastAPI)  │
-                    └─────────────┬─────────────┘
-                                  │
-                  ┌───────────────┴───────────────┐
-                  │        Sandbox Manager        │
-                  │ (Docker + gVisor + AST Check) │
-                  └───────────────┬───────────────┘
-                                  │
-            ┌─────────────────────┼─────────────────────┐
-            ▼                     ▼                     ▼
-     ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-     │  Sandbox (1)  │     │  Sandbox (2)  │     │  Sandbox (n)  │
-     │ [ gVisor Kernel]    │ [ gVisor Kernel]    │ [ gVisor Kernel]
-     │ [ Python App  ]    │ [ Python App  ]    │ [ Python App  ]
-     └───────────────┘     └───────────────┘     └───────────────┘
-```
-
----
-
-## 🚦 快速启动
-
-### 1. 本地开发模式 (Windows / macOS / Linux)
-
-本地模式下不涉及 gVisor，使用 standard Docker 运行时。
+### 本地运行
 
 ```bash
-# 1. 构建镜像
-docker build -t code-executor-sandbox:latest -f Dockerfile.sandbox .
+# 安装依赖
+pip install -r requirements.txt
+
+# 启动服务
+uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+### Docker 运行
+
+```bash
+# 构建镜像
 docker build -t code-executor-service:latest .
 
-# 2. 启动服务 (使用 docker-compose)
-docker-compose up -d
+# 运行容器
+docker run -d -p 8080:8080 --name code-executor code-executor-service:latest
 ```
 
-### 2. 生产安全模式 (Linux / WSL2)
+### Docker Compose
 
-在 Linux 环境下，您可以启用 gVisor 提供硬件级隔离。
-
-#### 步骤 A: 安装 gVisor (runsc)
-
-gVisor 是谷歌开发的内核隔离技术。你可以根据操作系统选择以下安装方式：
-
-##### 1. 在 Linux 或 WSL2 (Ubuntu) 上安装
-我们提供了自动化安装脚本，会自动下载 `runsc` 二进制文件并配置 Docker：
-
-```bash
-# 1. 如果你在 Windows 上，请先进入 WSL (例如 Ubuntu)
-# 2. 切换到脚本目录
-cd scripts/
-
-# 3. 运行安装脚本
-chmod +x install_gvisor.sh
-sudo ./install_gvisor.sh
-```
-
-##### 2. Windows 特有步骤 (使用 Docker Desktop)
-如果脚本执行后 `systemctl restart docker` 报错（这在 Docker Desktop WSL 后端很常见），请进行手动配置：
-
-1.  **打开 Docker Desktop 设置**: 点击右上角齿轮图标 -> `Docker Engine`。
-2.  **添加运行时配置**: 在 JSON 配置中添加 `runtimes` 节点：
-    ```json
-    {
-      "runtimes": {
-        "runsc": {
-          "path": "/usr/local/bin/runsc"
-        }
-      }
-    }
-    ```
-3.  **应用并重启**: 点击 `Apply & Restart`。
-
-##### 3. 验证安装
-在终端（WSL 或 Linux）运行以下命令：
-```bash
-docker run --rm --runtime=runsc hello-world
-```
-如果输出 `Hello from Docker!`，说明配置成功。
-
-#### 步骤 B: 启用配置
-修改 `.env` 文件或设置环境变量：
-```bash
-# 启用 gVisor
-SANDBOX_SECURITY__USE_GVISOR=true
-```
-
-#### 步骤 C: 部署服务
 ```bash
 docker-compose up -d
 ```
 
----
+## API 接口
 
-## 🛠️ 环境配置
+### 健康检查
+```
+GET /health
+```
 
-| 变量名 | 默认值 | 说明 |
-|------|--------|------|
-| `SANDBOX_DOCKER_IMAGE` | `code-executor-sandbox:latest` | 执行环境镜像名称 |
-| `SANDBOX_SECURITY__USE_GVISOR` | `false` | 是否开启 gVisor 隔离 |
-| `SANDBOX_RESOURCE__DEFAULT_MEMORY_MB` | `512` | 单个沙箱默认内存限制 |
-| `SANDBOX_TIMEOUT__EXECUTION_TIMEOUT` | `300` | 单次执行超时时间 (秒) |
+### 会话管理
 
----
+```bash
+# 创建会话
+POST /sessions
+{
+  "session_id": "optional-custom-id"
+}
 
-## 📖 API 接口摘要
+# 获取会话
+GET /sessions/{session_id}
+
+# 删除会话
+DELETE /sessions/{session_id}
+```
 
 ### 代码执行
-`POST /sessions/{session_id}/execute`
-- **输入**: `{ "code": "import pandas as pd; print(df.head())" }`
-- **输出**: 包含 `stdout`, `stderr`, `charts` (SVG), `tables` (JSON) 等。
-
-### 文件管理
-- `POST /sessions/{session_id}/upload`: 上传数据文件。
-- `GET /sessions/{session_id}/files`: 查看沙箱内生成的文件。
-
----
-
-## 🧪 测试
 
 ```bash
-# 运行单元测试
-pytest tests/
-
-# 运行安全检查器测试
-python test_validator_quick.py
+POST /sessions/{session_id}/execute
+{
+  "code": "import pandas as pd\nprint('Hello')",
+  "timeout": 300
+}
 ```
 
-## 📜 License
+### 数据加载
+
+```bash
+# 加载 JSON 数据
+POST /sessions/{session_id}/load-data
+{
+  "data_json": "[{\"a\": 1}, {\"a\": 2}]",
+  "filename": "data.csv"
+}
+
+# 上传文件
+POST /sessions/{session_id}/upload
+Content-Type: multipart/form-data
+file: <binary>
+filename: data.csv
+```
+
+### 文件管理
+
+```bash
+# 列出文件
+GET /sessions/{session_id}/files
+
+# 下载文件
+GET /sessions/{session_id}/files/{data|output}/{filename}
+
+# 获取表格模式
+GET /sessions/{session_id}/schemas
+
+# 获取多表格上下文
+GET /sessions/{session_id}/context
+```
+
+## Python 客户端
+
+```python
+from client import CodeExecutorClient
+
+async def main():
+    async with CodeExecutorClient("http://localhost:8080") as client:
+        # 创建会话
+        session = await client.create_session("my-session")
+        
+        # 上传数据
+        with open("data.csv", "rb") as f:
+            await client.upload_file("my-session", f.read(), "data.csv")
+        
+        # 执行代码
+        result = await client.execute_code("my-session", """
+import pandas as pd
+import matplotlib.pyplot as plt
+
+print(df.head())
+df.plot(kind='bar')
+plt.savefig('chart.png')
+""")
+        
+        print(result.output)
+        print(f"Charts: {len(result.charts)}")
+```
+
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| WORKSPACE_DIR | /workspace | 工作空间目录 |
+| PYTHONUNBUFFERED | 1 | Python 输出不缓冲 |
+
+## 推送到 Docker Hub
+
+```bash
+# 登录
+docker login
+
+# 标记镜像
+docker tag code-executor-service:latest your-username/code-executor-service:latest
+
+# 推送
+docker push your-username/code-executor-service:latest
+
+#启动
+docker run -d -p 8080:8080 --name code-executor code-executor-service:latest
+```
+
+## 在 Kubernetes 中部署
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: code-executor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: code-executor
+  template:
+    metadata:
+      labels:
+        app: code-executor
+    spec:
+      containers:
+      - name: code-executor
+        image: your-username/code-executor-service:latest
+        ports:
+        - containerPort: 8080
+        resources:
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: code-executor
+spec:
+  selector:
+    app: code-executor
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+```
+
+## 安全注意事项
+
+⚠️ 此服务执行任意 Python 代码，请确保：
+
+1. 在隔离的网络环境中运行
+2. 限制容器资源（CPU、内存）
+3. 不要暴露到公网
+4. 定期清理过期会话
+5. 考虑添加认证机制
+
+## License
 
 MIT

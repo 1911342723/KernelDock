@@ -95,7 +95,7 @@ class SandboxResourceConfig(BaseModel):
         description="默认 CPU 核心数"
     )
     default_memory_mb: int = Field(
-        default=512, 
+        default=256, 
         ge=256, 
         le=4096, 
         description="默认内存限制（MB）"
@@ -203,6 +203,10 @@ class SandboxTimeoutConfig(BaseModel):
     
     定义各种超时参数。
     Requirements: 11.3 (支持配置超时参数)
+    
+    注意: session_idle_timeout 默认为 15 分钟（900 秒），
+    这是为了在 4C4G 小机器上提高并发能力，避免僵尸会话浪费资源。
+    如果需要更长的空闲时间，可以通过环境变量 SANDBOX_TIMEOUT__SESSION_IDLE_TIMEOUT 配置。
     """
     execution_timeout: int = Field(
         default=300, 
@@ -211,10 +215,10 @@ class SandboxTimeoutConfig(BaseModel):
         description="代码执行超时（秒）"
     )
     session_idle_timeout: int = Field(
-        default=3600, 
+        default=900,  # 15 分钟，优化并发能力
         ge=60, 
         le=86400, 
-        description="会话空闲超时（秒）"
+        description="会话空闲超时（秒），默认 15 分钟"
     )
     session_max_timeout: int = Field(
         default=43200, 
@@ -244,7 +248,7 @@ class ContainerPoolConfig(BaseModel):
         description="预热容器数量"
     )
     max_concurrent_sandboxes: int = Field(
-        default=50, 
+        default=20, 
         ge=1, 
         le=200, 
         description="最大并发沙箱数"

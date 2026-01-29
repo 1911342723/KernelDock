@@ -31,8 +31,8 @@ ENV PYTHONUNBUFFERED=1 \
     MPLBACKEND=Agg \
     QT_QPA_PLATFORM=offscreen \
     WORKSPACE_DIR=/workspace \
-    # 设置 Python 路径以包含安装的依赖
-    PYTHONPATH=/app/deps:$PYTHONPATH
+    # 设置 Python 路径以包含应用根目录和安装的依赖
+    PYTHONPATH=/app:/app/deps:$PYTHONPATH
 
 # 安装系统依赖（合并 RUN 命令以减少镜像层数）
 RUN apt-get update && apt-get install -y --no-install-recommends \
