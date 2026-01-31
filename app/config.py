@@ -333,6 +333,18 @@ class SandboxSettings(BaseSettings):
         description="沙箱网络名称"
     )
     
+    # Sentry 配置
+    sentry_dsn: str = Field(
+        default="",
+        description="Sentry DSN"
+    )
+    sentry_traces_sample_rate: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Sentry 追踪采样率"
+    )
+    
     @field_validator("log_level")
     @classmethod
     def validate_log_level(cls, v: str) -> str:
