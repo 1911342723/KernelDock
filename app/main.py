@@ -721,4 +721,9 @@ async def get_statistics():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8080,
+        ws_max_size=50 * 1024 * 1024  # 50MB WebSocket 消息大小限制
+    )

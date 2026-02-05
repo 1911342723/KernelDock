@@ -331,6 +331,8 @@ async def websocket_endpoint(websocket: WebSocket):
     - 服务端响应 JSON 消息：{"type": "response", "id": "xxx", "success": true, "data": {...}}
     - 服务端推送输出：{"type": "output", "session_id": "xxx", "data": {"stdout": "..."}}
     - 心跳：{"type": "heartbeat"} / {"type": "heartbeat_ack"}
+    
+    注意：WebSocket 消息大小限制需要在 uvicorn 启动时配置 --ws-max-size
     """
     connection_id = str(uuid.uuid4())
     await connection_manager.connect(websocket, connection_id)

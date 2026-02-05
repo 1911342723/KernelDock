@@ -95,43 +95,54 @@ def _setup_matplotlib() -> None:
         import matplotlib.pyplot as plt
         import matplotlib.font_manager as fm
         
-        # 手动添加字体目录
+        # 重建字体缓存
+        fm._load_fontmanager(try_read_cache=False)
+        
+        # 手动添加字体目录（Debian/Ubuntu 字体路径）
         font_dirs = [
             '/usr/share/fonts/truetype/wqy',
             '/usr/share/fonts/opentype/noto',
+            '/usr/share/fonts/truetype/noto',
+            '/usr/share/fonts/truetype/dejavu',
+            '/usr/share/fonts/truetype/liberation',
+            '/usr/share/fonts/opentype',
+            '/usr/share/fonts/truetype',
         ]
         for font_dir in font_dirs:
             if os.path.exists(font_dir):
-                for font_file in os.listdir(font_dir):
-                    font_path = os.path.join(font_dir, font_file)
-                    if font_file.endswith(('.ttf', '.otf', '.ttc')):
-                        try:
-                            fm.fontManager.addfont(font_path)
-                        except Exception:
-                            pass
+                for root, dirs, files in os.walk(font_dir):
+                    for font_file in files:
+                        if font_file.endswith(('.ttf', '.otf', '.ttc')):
+                            font_path = os.path.join(root, font_file)
+                            try:
+                                fm.fontManager.addfont(font_path)
+                            except Exception:
+                                pass
         
         # 查找可用的中文字体（科研规范优先）
         available_fonts = set(f.name for f in fm.fontManager.ttflist)
+        print(f"[Font] Available CJK fonts: {[f for f in available_fonts if 'CJK' in f or 'Hei' in f or 'Song' in f or 'Noto' in f][:10]}")
+        
         chinese_fonts = [
-            'SimHei',               # 科研图表标准字体
-            'Microsoft YaHei',
-            'WenQuanYi Micro Hei',
-            'WenQuanYi Zen Hei',
-            'Noto Sans CJK SC',
+            'Noto Sans CJK SC',     # Debian 安装的 Noto CJK
             'Noto Sans CJK JP',
             'Noto Sans CJK TC',
+            'WenQuanYi Micro Hei',  # 文泉驿微米黑
+            'WenQuanYi Zen Hei',
+            'SimHei',               # 科研图表标准字体
+            'Microsoft YaHei',
             'Noto Serif CJK SC',
-            'Noto Serif CJK JP',
             'PingFang SC',
         ]
         selected_font = next(
             (f for f in chinese_fonts if f in available_fonts),
             'DejaVu Sans'
         )
-        print(f"[Font] Using: {selected_font}")
+        print(f"[Font] Selected: {selected_font}")
         
         # 应用字体配置
         plt.rcParams['font.sans-serif'] = [selected_font, 'DejaVu Sans', 'Arial']
+        plt.rcParams['font.family'] = 'sans-serif'
         plt.rcParams['axes.unicode_minus'] = False
         plt.rcParams['figure.dpi'] = 150
         plt.rcParams['savefig.dpi'] = 300
