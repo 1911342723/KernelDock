@@ -2,9 +2,9 @@
 图表捕获模块
 
 使用更可靠的机制捕获 matplotlib 图表：
-- 注册 plt.show() 和 plt.savefig() 钩子
-- 自动保存图表到输出目录
-- 生成 SVG base64 用于前端显示
+- 注册 plt.show()、plt.savefig() 和 plt.close() 钩子
+- 生成 SVG base64 通过 stdout 传输给调用方
+- 不写磁盘文件，避免 output 目录无限膨胀
 """
 
 import base64
@@ -35,38 +35,40 @@ def save_figure(
     name: str = "chart",
     format: str = "svg",
     output_dir: Optional[str] = None,
-) -> str:
+) -> Optional[str]:
     """
-    保存图表并捕获
+    捕获图表为 base64 并通过 stdout 输出
+    
+    仅在显式指定 output_dir 时才写磁盘文件。
     
     Args:
         fig: matplotlib Figure 对象
         name: 图表名称（不含扩展名）
         format: 图表格式（svg、png、pdf）
-        output_dir: 输出目录（可选）
+        output_dir: 输出目录（可选，指定时才写文件）
         
     Returns:
-        保存的文件路径
+        保存的文件路径（如果写了文件），否则 None
     """
-    from .setup import get_output_dir
+    file_path = None
     
-    output_dir = output_dir or get_output_dir()
-    file_path = os.path.join(output_dir, f"{name}.{format}")
+    # 仅在显式指定 output_dir 时写磁盘
+    if output_dir:
+        file_path = os.path.join(output_dir, f"{name}.{format}")
+        fig.savefig(file_path, format=format, bbox_inches='tight', facecolor='white')
     
-    # 保存到文件
-    fig.savefig(file_path, format=format, bbox_inches='tight', facecolor='white')
-    
-    # 生成 base64（仅 SVG 格式）
+    # 始终生成 base64 通过 stdout 传输
     if format == 'svg':
         _capture_figure_to_base64(fig, file_path)
     
-    print(f"CHART_SAVED: {file_path}")
     return file_path
 
 
 def capture_current_figures() -> List[Dict[str, Any]]:
     """
     捕获当前所有未关闭的 matplotlib 图表
+    
+    仅生成 base64 通过 stdout 传输，不写磁盘文件，避免 output 目录膨胀。
     
     Returns:
         捕获的图表数据列表
@@ -75,9 +77,7 @@ def capture_current_figures() -> List[Dict[str, Any]]:
     
     try:
         import matplotlib.pyplot as plt
-        from .setup import get_output_dir
         
-        output_dir = get_output_dir()
         captured = []
         
         for fig_num in plt.get_fignums():
@@ -88,19 +88,14 @@ def capture_current_figures() -> List[Dict[str, Any]]:
             fig = plt.figure(fig_num)
             _captured_figure_ids.add(fig_num)
             
-            # 保存 SVG 文件
-            chart_idx = len(_captured_charts) + len(captured) + 1
-            svg_path = os.path.join(output_dir, f"chart_{chart_idx}.svg")
-            fig.savefig(svg_path, format='svg', bbox_inches='tight', facecolor='white')
-            
-            # 生成 base64
+            # 仅生成内存中的 base64，不写磁盘
             buf = io.BytesIO()
             fig.savefig(buf, format='svg', bbox_inches='tight', facecolor='white')
             buf.seek(0)
             svg_b64 = base64.b64encode(buf.read()).decode('utf-8')
             
             chart_data = {
-                "path": svg_path,
+                "path": None,
                 "base64": svg_b64,
                 "format": "svg"
             }
@@ -108,7 +103,6 @@ def capture_current_figures() -> List[Dict[str, Any]]:
             
             # 输出标记供解析
             print(f"SVG_BASE64_START:{svg_b64}:SVG_BASE64_END")
-            print(f"CHART_SAVED: {svg_path}")
         
         _captured_charts.extend(captured)
         return captured
@@ -117,8 +111,8 @@ def capture_current_figures() -> List[Dict[str, Any]]:
         return []
 
 
-def _capture_figure_to_base64(fig, file_path: str) -> None:
-    """将图表捕获为 base64 并添加到列表"""
+def _capture_figure_to_base64(fig, file_path: Optional[str] = None) -> None:
+    """将图表捕获为 base64 并添加到列表，仅通过 stdout 输出"""
     global _captured_charts, _captured_figure_ids
     
     # 检查是否已捕获（通过 figure number）
@@ -148,7 +142,7 @@ def _register_capture_hooks() -> None:
     """
     注册图表捕获钩子
     
-    拦截 plt.show() 和 plt.savefig() 调用，自动捕获图表。
+    拦截 plt.show()、plt.savefig() 和 plt.close() 调用，自动捕获图表。
     """
     global _hooks_registered
     
@@ -157,11 +151,11 @@ def _register_capture_hooks() -> None:
     
     try:
         import matplotlib.pyplot as plt
-        from .setup import get_output_dir
         
         # 保存原始函数
         _original_show = plt.show
         _original_savefig = plt.savefig
+        _original_close = plt.close
         
         def _wrapped_show(*args, **kwargs):
             """包装的 show 函数，自动捕获图表"""
@@ -172,32 +166,24 @@ def _register_capture_hooks() -> None:
             """包装的 savefig 函数，额外捕获 base64"""
             result = _original_savefig(*args, **kwargs)
             
-            # 检查是否需要捕获
+            # 捕获当前 figure 的 base64（不额外写磁盘）
             if plt.get_fignums():
                 fig = plt.gcf()
-                
-                # 获取保存路径
-                if args:
-                    file_path = args[0]
-                else:
-                    file_path = kwargs.get('fname', '')
-                
-                # 如果不是 SVG 格式，额外生成 SVG
-                if not str(file_path).endswith('.svg'):
-                    output_dir = get_output_dir()
-                    chart_idx = len(_captured_charts) + 1
-                    svg_path = os.path.join(output_dir, f"chart_{chart_idx}.svg")
-                    fig.savefig(svg_path, format='svg', bbox_inches='tight', facecolor='white')
-                    file_path = svg_path
-                
-                _capture_figure_to_base64(fig, str(file_path))
-                print(f"CHART_SAVED: {file_path}")
+                _capture_figure_to_base64(fig)
             
             return result
+        
+        def _wrapped_close(*args, **kwargs):
+            """包装的 close 函数，在关闭前捕获未捕获的图表"""
+            # 在关闭前先捕获所有未捕获的图表
+            capture_current_figures()
+            # 调用原始 close
+            _original_close(*args, **kwargs)
         
         # 替换函数
         plt.show = _wrapped_show
         plt.savefig = _wrapped_savefig
+        plt.close = _wrapped_close
         
         _hooks_registered = True
         
