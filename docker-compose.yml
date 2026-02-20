@@ -7,14 +7,27 @@ services:
       dockerfile: Dockerfile
     image: code-executor:latest
     container_name: code-executor
+    # 网关需要访问 Docker socket 管理沙箱子容器，必须以 root 运行
+    # 安全隔离由沙箱容器自身保证（非 root + 只读 rootfs + gVisor）
+    user: root
     ports:
       - "8080:8080"
     volumes:
       # 持久化 workspace 数据
       - executor_workspace:/workspace
+      # 允许管理 docker 以启动沙箱子容器
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - PYTHONUNBUFFERED=1
       - WORKSPACE_DIR=/workspace
+      # ---- 沙箱镜像（Dockerfile.sandbox 构建的镜像） ----
+      - SANDBOX_DOCKER_IMAGE=code-executor-sandbox:latest
+      # ---- 给真实跑数据分析的沙箱限制 ----
+      - SANDBOX_RESOURCE__DEFAULT_CPU=1.0           # 每个沙箱最多占 1核
+      - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=512       # 每个沙箱物理可用 512MB
+      # ---- 强力压舱石：并发排队与预热池 ----
+      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=4    # 排队机制：最多并发 4 个任务 (4 * 512M = 2G)
+      - SANDBOX_POOL__POOL_SIZE=2                   # 总是保持 2 个待命空热容器 (2 * 512M = 1G)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -25,12 +38,12 @@ services:
     # 资源限制
     deploy:
       resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
+        limits:     # 这是“硬上限” (网关进程最多能用多少)
+          cpus: '1'       # 网关最多吃掉 1 核 CPU
+          memory: 1G      # 网关最多使用 1GB 内存
+        reservations:    # 这是“软保证” (Docker保证给网关留出多少)
+          cpus: '0.2'
+          memory: 256M
 
 volumes:
   executor_workspace:

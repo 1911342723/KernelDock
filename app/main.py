@@ -31,6 +31,7 @@ from .executor import session_manager, StatelessSession
 from .services.sandbox_manager import SandboxManager, SandboxState
 from .services.session_store import SessionStore, get_session_store
 from .services.health_monitor import HealthMonitor, get_health_monitor
+from .services.execution_queue import ExecutionQueue
 
 # 配置日志
 logging.basicConfig(level=getattr(logging, settings.log_level))
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 _sandbox_manager: Optional[SandboxManager] = None
 _session_store: Optional[SessionStore] = None
 _health_monitor: Optional[HealthMonitor] = None
+_execution_queue: Optional[ExecutionQueue] = None
 
 
 def get_sandbox_manager() -> SandboxManager:
@@ -58,9 +60,19 @@ async def lifespan(app: FastAPI):
     启动时初始化沙箱管理器、会话存储和健康监控器。
     关闭时清理所有资源。
     """
-    global _sandbox_manager, _session_store, _health_monitor
-    
+    global _sandbox_manager, _session_store, _health_monitor, _execution_queue
+
     logger.info("Code Executor Service 启动中...")
+
+    # 初始化执行队列
+    _execution_queue = ExecutionQueue(
+        max_concurrent=settings.queue.max_concurrent_executions,
+        avg_execution_time=settings.queue.initial_avg_execution_time,
+        queue_timeout=settings.queue.queue_timeout,
+    )
+    logger.info(
+        f"执行队列初始化完成: max_concurrent={settings.queue.max_concurrent_executions}"
+    )
     
     # 初始化会话存储
     _session_store = get_session_store()
@@ -85,8 +97,9 @@ async def lifespan(app: FastAPI):
         await _health_monitor.start_background_monitoring()
         
         # 设置 WebSocket 路由的沙箱管理器
-        from .websocket_routes import set_sandbox_manager
+        from .websocket_routes import set_sandbox_manager, set_execution_queue
         set_sandbox_manager(_sandbox_manager)
+        set_execution_queue(_execution_queue)
         
         logger.info("沙箱管理器初始化完成")
     except Exception as e:
@@ -188,6 +201,14 @@ class ExecuteCodeResponse(BaseModel):
     tables: List[dict]
     images: List[str]
     error: Optional[str]
+    queue_info: Optional[dict] = None
+
+
+class StatelessExecuteRequest(BaseModel):
+    """无状态执行请求（即用即毁模式）"""
+    code: str
+    timeout: int = 30
+    data_files: Optional[dict] = None  # {filename: base64_content}
 
 
 class LoadDataRequest(BaseModel):
@@ -397,18 +418,37 @@ async def delete_session(session_id: str):
 async def execute_code(session_id: str, request: ExecuteCodeRequest):
     """
     执行代码
-    
+
     Requirements 10.1, 10.4: 保持现有 API 接口格式不变
-    
+
+    如果执行队列可用，通过令牌桶控制并发；
     如果会话有关联的沙箱，使用 Docker exec 执行；
     否则使用本地 subprocess 执行。
     """
     session = session_manager.get_or_create_session(session_id)
-    
+
     # 更新会话活动时间
     if _session_store:
         await _session_store.update_activity(session_id)
-    
+
+    if _execution_queue:
+        # 通过执行队列控制并发
+        async with _execution_queue.acquire(session_id) as ticket:
+            result = await _do_execute_code(session_id, session, request)
+            # 注入排队信息
+            if isinstance(result, dict) and ticket.started_at:
+                result["queue_info"] = {
+                    "waited_seconds": round(ticket.started_at - ticket.enqueued_at, 2),
+                    "queue_position_on_entry": ticket.position,
+                }
+            return ExecuteCodeResponse(**result) if isinstance(result, dict) else result
+    else:
+        result = await _do_execute_code(session_id, session, request)
+        return ExecuteCodeResponse(**result) if isinstance(result, dict) else result
+
+
+async def _do_execute_code(session_id: str, session, request: ExecuteCodeRequest):
+    """实际执行代码逻辑（从 execute_code 提取）"""
     # 检查是否有沙箱
     if _sandbox_manager:
         sandbox_info = await _sandbox_manager.get_sandbox_by_session(session_id)
@@ -420,14 +460,14 @@ async def execute_code(session_id: str, request: ExecuteCodeRequest):
                     code=request.code,
                     timeout=request.timeout
                 )
-                return ExecuteCodeResponse(**result)
+                return result
             except Exception as e:
                 logger.error(f"沙箱执行失败: {e}")
                 # 回退到本地执行
-    
+
     # 使用本地执行（兼容模式）
     result = await session.execute_code(request.code, request.timeout)
-    return ExecuteCodeResponse(**result)
+    return result
 
 
 @app.post("/sessions/{session_id}/load-data", response_model=LoadDataResponse)
@@ -696,7 +736,7 @@ async def get_sandbox_metrics(sandbox_id: str):
 async def get_statistics():
     """
     获取服务统计信息
-    
+
     Requirements 10.6: 新增功能通过新的 API 端点提供
     """
     stats = {
@@ -705,18 +745,98 @@ async def get_statistics():
         "sandbox_manager_enabled": _sandbox_manager is not None,
         "session_count": len(session_manager.sessions),
     }
-    
+
     if _sandbox_manager:
         sandbox_stats = await _sandbox_manager.get_statistics()
         stats["sandbox"] = sandbox_stats
-    
+
     if _session_store:
         stats["session_store"] = {
             "total_sessions": await _session_store.get_session_count(),
             "active_sessions": await _session_store.get_active_session_count(),
         }
-    
+
+    if _execution_queue:
+        stats["execution_queue"] = _execution_queue.get_global_status()
+
     return stats
+
+
+@app.get("/queue/status")
+async def get_queue_status():
+    """
+    获取执行队列状态
+
+    返回当前排队数、执行数、平均耗时等信息。
+    """
+    if not _execution_queue:
+        return {"enabled": False, "message": "执行队列未启用"}
+    return {"enabled": True, **_execution_queue.get_global_status()}
+
+
+# ===== 即用即毁（Fire-and-Forget）无状态执行端点 =====
+
+@app.post("/execute", response_model=ExecuteCodeResponse)
+async def execute_stateless(request: StatelessExecuteRequest):
+    """
+    无状态代码执行（即用即毁模式）。
+
+    优先使用沙箱管理器（借容器 → 执行 → 归还），
+    沙箱不可用时回退到本地 StatelessSession 执行。
+
+    请求体:
+        code: Python 代码
+        timeout: 执行超时（秒，默认 30）
+        data_files: 数据文件字典 {filename: base64_content}（可选）
+    """
+    # 校验 data_files 总大小
+    if request.data_files:
+        total_size = sum(len(v) for v in request.data_files.values())
+        max_size = settings.fire_and_forget.max_data_size_mb * 1024 * 1024
+        if total_size > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"数据文件总大小超过限制（{settings.fire_and_forget.max_data_size_mb}MB）"
+            )
+
+    async def _do_execute():
+        # 优先使用沙箱管理器
+        if _sandbox_manager:
+            return await _sandbox_manager.execute_stateless(
+                code=request.code,
+                data_files=request.data_files,
+                timeout=request.timeout,
+            )
+
+        # 回退到本地执行
+        logger.info("沙箱管理器不可用，使用本地执行模式")
+        import uuid
+        tmp_session_id = f"stateless-{uuid.uuid4().hex[:8]}"
+        tmp_session = session_manager.create_session(tmp_session_id)
+        try:
+            # 注入 data_files 到本地 session
+            if request.data_files:
+                for fname, b64_content in request.data_files.items():
+                    file_bytes = base64.b64decode(b64_content)
+                    await tmp_session.load_file(file_bytes, fname)
+
+            result = await tmp_session.execute_code(request.code, request.timeout)
+            return result
+        finally:
+            session_manager.delete_session(tmp_session_id)
+
+    if _execution_queue:
+        async with _execution_queue.acquire("stateless") as ticket:
+            result = await _do_execute()
+            if ticket.started_at:
+                result["queue_info"] = {
+                    "waited_seconds": round(ticket.started_at - ticket.enqueued_at, 2),
+                    "queue_position_on_entry": ticket.position,
+                }
+            return ExecuteCodeResponse(**result)
+    else:
+        result = await _do_execute()
+        return ExecuteCodeResponse(**result)
 
 
 if __name__ == "__main__":

@@ -673,7 +673,207 @@ class SandboxManager:
         finally:
             # 注意：不关闭 executor，因为它使用的是共享的 docker_client
             pass
-    
+
+    async def execute_stateless(
+        self,
+        code: str,
+        data_files: Optional[Dict[str, str]] = None,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        无状态执行：借容器 → 注入数据 → 执行代码 → 清理 → 归还容器。
+
+        容器不与任何 session 绑定，执行完毕立即归还池，实现快速轮转。
+
+        Args:
+            code: Python 代码
+            data_files: 数据文件字典 {filename: base64_content}
+            timeout: 执行超时（秒）
+
+        Returns:
+            执行结果字典（与 execute_code 格式一致）
+        """
+        from ..executor import CodeExecutor
+
+        if not self._container_pool:
+            raise InternalError(reason="容器池未初始化")
+
+        # 1. 从池中借一个容器
+        pooled = await self._container_pool.acquire_for_execution()
+        if not pooled:
+            # 池空，回退到创建临时容器
+            logger.warning("容器池为空，创建临时容器执行")
+            return await self._execute_stateless_with_temp_container(
+                code, data_files, timeout
+            )
+
+        container_id = pooled.container_id
+        try:
+            # 2. 注入数据文件
+            if data_files:
+                await self._inject_data_files(container_id, data_files)
+
+            # 3. 执行代码
+            executor = CodeExecutor(self._docker_client)
+            result = await executor.execute_in_container(
+                container_id=container_id,
+                code=code,
+                data_dir="/data",
+                output_dir="/output",
+                timeout=timeout,
+            )
+
+            # 4. 清理容器工作空间
+            await self._cleanup_container_workspace(container_id)
+
+            # 5. 归还容器
+            await self._container_pool.release(container_id)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"无状态执行失败: {e}, 容器: {container_id[:12]}")
+            # 执行失败，尝试清理后归还；如果清理也失败则销毁
+            try:
+                await self._cleanup_container_workspace(container_id)
+                await self._container_pool.release(container_id)
+            except Exception:
+                logger.warning(f"容器 {container_id[:12]} 清理失败，销毁")
+                try:
+                    await self._docker_client.stop_container(container_id, timeout=5)
+                    await self._docker_client.remove_container(container_id, force=True)
+                except Exception:
+                    pass
+                # 触发补充
+                asyncio.create_task(self._container_pool.replenish())
+            raise
+
+    async def _execute_stateless_with_temp_container(
+        self,
+        code: str,
+        data_files: Optional[Dict[str, str]],
+        timeout: int,
+    ) -> Dict[str, Any]:
+        """池空时创建临时容器执行，执行完销毁。"""
+        from ..executor import CodeExecutor
+
+        resource_limits = self._resource_limiter.get_limits()
+        resource_kwargs = resource_limits.to_container_create_kwargs()
+        security_kwargs = self._security_policy.to_docker_config()
+        security_kwargs.pop("pids_limit", None)
+        security_kwargs.pop("privileged", None)
+
+        # 无状态容器没有 volume 挂载，需要将 /data 和 /output 也加入 tmpfs
+        tmpfs_config = self._security_policy.get_tmpfs_config()
+        tmpfs_config["/data"] = "size=500M,mode=1777,uid=1000,gid=1000"
+        tmpfs_config["/output"] = "size=500M,mode=1777,uid=1000,gid=1000"
+        tmpfs_config["/var/cache/fontconfig"] = "size=10M,mode=1777,uid=1000,gid=1000"
+
+        container_info = await self._docker_client.create_container(
+            image=self._docker_image,
+            command="sleep infinity",
+            detach=True,
+            network_mode="none",
+            tmpfs=tmpfs_config,
+            **resource_kwargs,
+            **security_kwargs,
+        )
+        container_id = container_info.container_id
+        await self._docker_client.start_container(container_id)
+
+        try:
+            if data_files:
+                await self._inject_data_files(container_id, data_files)
+
+            executor = CodeExecutor(self._docker_client)
+            result = await executor.execute_in_container(
+                container_id=container_id,
+                code=code,
+                data_dir="/data",
+                output_dir="/output",
+                timeout=timeout,
+            )
+            return result
+        finally:
+            try:
+                await self._docker_client.stop_container(container_id, timeout=5)
+                await self._docker_client.remove_container(container_id, force=True)
+            except Exception as e:
+                logger.warning(f"清理临时容器失败: {e}")
+
+    async def _inject_data_files(
+        self, container_id: str, data_files: Dict[str, str]
+    ) -> None:
+        """
+        将 base64 编码的数据文件注入容器的 /data 目录。
+
+        使用分块写入避免单次 echo 超过 shell ARG_MAX (~128KB) 限制。
+        与 CodeExecutor._put_file_to_container 使用相同的 24KB 分块策略。
+
+        Args:
+            container_id: 容器 ID
+            data_files: {filename: base64_content}
+        """
+        import base64 as b64
+
+        # 24KB raw = ~32KB base64, 远低于 ARG_MAX (~128KB)
+        RAW_CHUNK_SIZE = 24576
+
+        for filename, b64_content in data_files.items():
+            # 安全检查：文件名不能包含路径分隔符
+            safe_name = os.path.basename(filename)
+            if not safe_name:
+                continue
+
+            target_path = f"/data/{safe_name}"
+
+            # 先将 base64 解码为原始字节
+            try:
+                raw_data = b64.b64decode(b64_content)
+            except Exception as e:
+                logger.warning(f"解码数据文件失败: {safe_name}, {e}")
+                continue
+
+            # 分块写入：每块 24KB raw → base64 编码 → echo | base64 -d >> file
+            for i in range(0, len(raw_data), RAW_CHUNK_SIZE):
+                chunk = raw_data[i:i + RAW_CHUNK_SIZE]
+                b64_chunk = b64.b64encode(chunk).decode('ascii')
+                op = '>' if i == 0 else '>>'
+                result = await self._docker_client.exec_command(
+                    container_id,
+                    f"echo '{b64_chunk}' | base64 -d {op} {target_path}",
+                    timeout=30,
+                )
+                if result.exit_code != 0:
+                    logger.error(
+                        f"写入数据文件分块失败: {safe_name}, "
+                        f"chunk {i // RAW_CHUNK_SIZE}, "
+                        f"exit={result.exit_code}, stderr={result.stderr}"
+                    )
+                    break
+
+            logger.debug(
+                f"注入数据文件: {safe_name} ({len(raw_data)} bytes, "
+                f"{(len(raw_data) - 1) // RAW_CHUNK_SIZE + 1} chunks) "
+                f"-> {container_id[:12]}"
+            )
+
+    async def _cleanup_container_workspace(self, container_id: str) -> None:
+        """
+        清理容器内的 /data、/output、/tmp 目录内容，为下次复用做准备。
+
+        Args:
+            container_id: 容器 ID
+        """
+        cleanup_cmd = "rm -rf /data/* /output/* /tmp/*.py /tmp/*.json 2>/dev/null; true"
+        cleanup_timeout = settings.fire_and_forget.cleanup_timeout
+        try:
+            await self._docker_client.exec_command(
+                container_id, cleanup_cmd, timeout=cleanup_timeout
+            )
+        except Exception as e:
+            logger.warning(f"清理容器工作空间失败: {container_id[:12]}, {e}")
+
     async def list_sandboxes(
         self,
         state: Optional[SandboxState] = None,
@@ -907,10 +1107,20 @@ class SandboxManager:
         
         # 使用默认安全策略
         security_kwargs = self._security_policy.to_docker_config()
-        
+        # DockerClient.create_container 不接受 privileged 参数
+        security_kwargs.pop("privileged", None)
+
+        # 池容器用于无状态执行，没有 volume 挂载
+        # 需要将 /data 和 /output 也加入 tmpfs 使其可写
+        tmpfs_config = self._security_policy.get_tmpfs_config()
+        tmpfs_config["/data"] = "size=500M,mode=1777,uid=1000,gid=1000"
+        tmpfs_config["/output"] = "size=500M,mode=1777,uid=1000,gid=1000"
+        tmpfs_config["/var/cache/fontconfig"] = "size=10M,mode=1777,uid=1000,gid=1000"
+
         return {
             **resource_kwargs,
             **security_kwargs,
+            "tmpfs": tmpfs_config,
             "network_mode": "none",  # 预热容器默认无网络
         }
 

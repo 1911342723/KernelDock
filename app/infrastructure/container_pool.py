@@ -335,6 +335,37 @@ class ContainerPool:
             logger.warning("容器池为空，无可用预热容器")
             return None
     
+    async def acquire_for_execution(self) -> Optional[PooledContainer]:
+        """
+        获取一个预热容器用于临时执行（执行完毕后应调用 release() 归还）
+
+        与 acquire() 的区别：不触发异步补充，因为容器会被归还。
+
+        Returns:
+            PooledContainer 对象，如果池为空则返回 None
+        """
+        start_time = time.monotonic()
+
+        async with self._lock:
+            container = self._get_available_container()
+
+            if container:
+                self._available_containers.remove(container)
+                del self._all_containers[container.container_id]
+                self._total_acquired += 1
+
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"分配临时执行容器: {container.container_id[:12]}, "
+                    f"耗时: {elapsed*1000:.2f}ms, "
+                    f"剩余可用: {self.available_count}"
+                )
+
+                return container
+
+            logger.warning("容器池为空，无可用预热容器（临时执行）")
+            return None
+
     async def release(self, container_id: str) -> None:
         """
         释放容器回池
@@ -511,7 +542,19 @@ class ContainerPool:
             
             # 启动容器
             await self._docker_client.start_container(container_info.container_id)
-            
+
+            # 预加载常用库，减少首次执行时的 import 开销
+            try:
+                await self._docker_client.exec_command(
+                    container_info.container_id,
+                    "python -c 'import pandas, numpy, matplotlib, seaborn; print(\"PREWARMED\")'",
+                    timeout=30
+                )
+                logger.debug(f"预热容器库加载完成: {container_info.container_id[:12]}")
+            except Exception as prewarm_err:
+                # 预加载失败不影响容器可用性
+                logger.warning(f"预热容器库加载失败（不影响使用）: {prewarm_err}")
+
             self._total_created += 1
             
             pooled_container = PooledContainer(

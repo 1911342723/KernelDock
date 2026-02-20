@@ -20,6 +20,7 @@ class ExecutionResult:
     tables: List[Dict]
     images: List[str]
     error: Optional[str]
+    queue_info: Optional[Dict] = None
 
 
 class CodeExecutorClient:
@@ -160,6 +161,37 @@ class CodeExecutorClient:
         )
         resp.raise_for_status()
         return resp.json().get("cleaned", 0)
+
+    async def execute_stateless(
+        self,
+        code: str,
+        data_files: Dict[str, str] = None,
+        timeout: int = 30,
+    ) -> ExecutionResult:
+        """
+        无状态执行代码（即用即毁模式）。
+
+        不需要创建 session，直接提交代码和数据文件执行。
+        容器执行完立即归还池，适合一次性绘图/计算场景。
+
+        Args:
+            code: Python 代码
+            data_files: 数据文件字典 {filename: base64_content}
+            timeout: 执行超时（秒）
+
+        Returns:
+            ExecutionResult
+        """
+        payload = {"code": code, "timeout": timeout}
+        if data_files:
+            payload["data_files"] = data_files
+        resp = await self._client.post(
+            f"{self.base_url}/execute",
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return ExecutionResult(**data)
 
 
 # 便捷函数

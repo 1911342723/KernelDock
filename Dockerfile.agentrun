@@ -1,16 +1,6 @@
 # =============================================================================
-# 沙箱基础镜像 Dockerfile
-# =============================================================================
-# 用途：为代码执行沙箱提供安全隔离的 Python 数据分析环境
-# 
-# 安全特性：
-# - 以非 root 用户运行（Requirement 6.1）
-# - 支持只读根文件系统（Requirement 6.3）
-# - 仅允许写入指定目录：/workspace, /tmp, /data, /output
-#
-# 预装库（Requirement 4.7）：
-# - pandas, numpy, matplotlib, seaborn
-# - scipy, scikit-learn, plotly
+# AgentRun 沙箱自定义镜像 Dockerfile
+# 基于 code-executor-service/Dockerfile.sandbox 构建，补充 AgentRun 依赖
 # =============================================================================
 
 # ============================================
@@ -26,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /build
 
 # 创建 requirements 文件，包含数据分析和科研绘图常用库
-# 使用固定版本以确保构建可重复性
+# 以及新增的 AgentRun SDK
 RUN cat > requirements.txt << 'EOF'
 # ===========================================
 # 数据处理核心库
@@ -48,38 +38,24 @@ pyecharts>=2.0.0,<3.0.0
 # ===========================================
 # 科研专用绘图
 # ===========================================
-# 水文地质图（Piper、Stiff、Durov等）
 wqchartpy>=0.1.10
-# 三元图/三角图
 python-ternary>=1.0.8,<2.0.0
-# 高级统计图（ggplot2风格）
 plotnine>=0.12.0,<1.0.0
-# 韦恩图
 matplotlib-venn>=0.11.0,<1.0.0
-# 桑基图/冲积图
 holoviews>=1.18.0,<2.0.0
-# 词云
 wordcloud>=1.9.0,<2.0.0
-# 树状图/矩形树图
 squarify>=0.4.3,<1.0.0
-# SVG雷达图
 pygal>=3.0.0,<4.0.0
-# 科学配色
 palettable>=3.3.0,<4.0.0
 cmocean>=3.0.0,<4.0.0
 colorcet>=3.0.0,<4.0.0
-# 出版级科研图表样式
 SciencePlots>=2.1.0,<3.0.0
 
 # ===========================================
-# 科学计算
+# 科学计算与统计分析
 # ===========================================
 scipy>=1.10.0,<2.0.0
 sympy>=1.12,<2.0.0
-
-# ===========================================
-# 统计分析
-# ===========================================
 statsmodels>=0.14.0,<1.0.0
 pingouin>=0.5.3,<1.0.0
 scikit-learn>=1.2.0,<2.0.0
@@ -94,23 +70,12 @@ cartopy>=0.22.0,<1.0.0
 contextily>=1.4.0,<2.0.0
 
 # ===========================================
-# 网络图与关系图
-# ===========================================
-networkx>=3.2.0,<4.0.0
-pyvis>=0.3.0,<1.0.0
-graphviz>=0.20.0,<1.0.0
-
-# ===========================================
-# 图像处理
+# 图像处理与文件处理
 # ===========================================
 pillow>=10.0.0,<12.0.0
 opencv-python-headless>=4.8.0,<5.0.0
 scikit-image>=0.22.0,<1.0.0
 cairosvg>=2.7.0,<3.0.0
-
-# ===========================================
-# 数据文件支持
-# ===========================================
 openpyxl>=3.1.0,<4.0.0
 xlrd>=2.0.0,<3.0.0
 xlsxwriter>=3.1.0,<4.0.0
@@ -119,13 +84,7 @@ python-docx>=1.1.0,<2.0.0
 PyPDF2>=3.0.0,<4.0.0
 
 # ===========================================
-# 交互式环境
-# ===========================================
-ipython>=8.18.0,<9.0.0
-ipywidgets>=8.1.0,<9.0.0
-
-# ===========================================
-# 其他实用工具
+# 其他杂项
 # ===========================================
 tabulate>=0.9.0,<1.0.0
 tqdm>=4.66.0,<5.0.0
@@ -133,10 +92,14 @@ python-dateutil>=2.8.0,<3.0.0
 pytz>=2023.3
 pyyaml>=6.0.0,<7.0.0
 adjustText>=0.8,<1.0.0
+
+# ===========================================
+# 阿里云 AgentRun SDK
+# ===========================================
+agentrun-sdk
 EOF
 
 # 安装 Python 依赖到临时目录
-# 使用 --target 将依赖安装到指定目录，便于复制到最终镜像
 RUN pip install --no-cache-dir --target=/build/deps -r requirements.txt
 
 # ============================================
@@ -144,9 +107,8 @@ RUN pip install --no-cache-dir --target=/build/deps -r requirements.txt
 # ============================================
 FROM python:3.11-slim
 
-# 镜像元数据
-LABEL maintainer="Code Executor Service" \
-      description="沙箱基础镜像 - 安全隔离的 Python 数据分析环境" \
+LABEL maintainer="AgentRun Custom Image" \
+      description="包含科研作图与字体支持的阿里云 AgentRun 沙箱镜像" \
       version="1.0.0"
 
 # 设置环境变量
@@ -154,72 +116,51 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONIOENCODING=utf-8 \
     PYTHONUTF8=1 \
-    # matplotlib 无头模式配置（用于服务器端渲染）
     MPLBACKEND=Agg \
-    # Qt 无头模式（某些可视化库可能需要）
     QT_QPA_PLATFORM=offscreen \
-    # matplotlib 配置目录（设置为可写目录）
     MPLCONFIGDIR=/tmp/matplotlib \
-    # 设置 Python 路径以包含安装的依赖
     PYTHONPATH=/opt/sandbox/deps \
-    # 工作目录环境变量
     WORKSPACE_DIR=/workspace \
-    DATA_DIR=/data \
-    OUTPUT_DIR=/output \
-    # 设置 HOME 目录为可写目录（某些库需要写入 HOME）
+    DATA_DIR=/workspace \
+    OUTPUT_DIR=/workspace \
     HOME=/workspace
 
 # 安装系统依赖
-# 合并 RUN 命令以减少镜像层数，优化镜像大小
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # 字体支持（中文显示必需）
     fonts-noto-cjk \
     fonts-noto-cjk-extra \
     fonts-wqy-microhei \
     fonts-wqy-zenhei \
-    fonts-arphic-uming \
-    fonts-arphic-ukai \
-    fonts-liberation \
     fontconfig \
-    # matplotlib 运行时依赖
     libfreetype6 \
     libpng16-16 \
-    # OpenCV 依赖（Debian Trixie 使用 libgl1 替代 libgl1-mesa-glx）
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender1 \
-    # geo-packages and other dependencies
     libgdal-dev \
     libgeos-dev \
     libproj-dev \
-    # Graphviz 依赖
     graphviz \
     libgraphviz-dev \
-    # Cairo 依赖（cairosvg）
     libcairo2 \
     libcairo2-dev \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
-    # 编译依赖（某些包需要）
     gcc \
     g++ \
     wget \
-    # 清理缓存以减小镜像大小
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
     && rm -rf /var/cache/apt/archives/* \
     && rm -rf /tmp/* /var/tmp/* \
-    # 下载 SimHei 字体（科研图表标准字体）
     && mkdir -p /usr/share/fonts/truetype/simhei \
     && wget -q -O /usr/share/fonts/truetype/simhei/SimHei.ttf \
        "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf" \
-    # 刷新字体缓存
     && fc-cache -fv
 
-# 创建非 root 用户（Requirement 6.1：以非 root 用户身份运行）
-# 使用固定 UID/GID 以确保一致性和可预测性
+# 创建非 root 用户 (AgentRun 沙箱会作为无特权用户运行)
 ARG USER_UID=1000
 ARG USER_GID=1000
 
@@ -229,36 +170,22 @@ RUN groupadd --gid ${USER_GID} sandbox \
        --no-create-home \
        sandbox
 
-# 创建应用依赖目录
+# 复制依赖
 RUN mkdir -p /opt/sandbox/deps
-
-# 从构建阶段复制 Python 依赖
 COPY --from=builder /build/deps /opt/sandbox/deps
 
-# 复制 sandbox_runtime 预置运行时库
-# 这是重构后的核心库，包含环境初始化、图表捕获、表格输出等功能
+# 从原基础镜像拷贝 sandbox_runtime
 COPY sandbox_runtime /opt/sandbox/deps/sandbox_runtime
 
-# 创建可写目录（Requirement 6.3：只读根文件系统，仅允许写入指定目录）
-# /workspace - 代码执行的工作空间
-# /tmp       - 临时文件目录
-# /data      - 数据文件目录（用于上传的数据文件）
-# /output    - 输出文件目录（用于生成的图表和结果）
-RUN mkdir -p /workspace /data /output /tmp/matplotlib \
-    && chown -R sandbox:sandbox /workspace /data /output /tmp \
-    && chmod 755 /workspace /data /output \
-    && chmod 1777 /tmp
+# 创建可写目录
+RUN mkdir -p /workspace /tmp/matplotlib \
+    && chown -R sandbox:sandbox /workspace /tmp \
+    && chmod 755 /workspace \
+    && chmod 1777 /tmp \
+    && chmod -R 555 /opt/sandbox/deps
 
-# 设置依赖目录权限（只读）
-RUN chmod -R 555 /opt/sandbox/deps
-
-# 切换到非 root 用户
 USER sandbox
-
-# 设置工作目录
 WORKDIR /workspace
 
-# 容器启动时的默认命令
-# 沙箱容器通常通过 docker exec 执行代码，这里提供一个保持容器运行的命令
-# 使用 tail -f /dev/null 保持容器运行，等待代码执行请求
+# AgentRun code interpreter 沙箱默认入口执行即可，或保留 tail 夯住以方便调试调试
 CMD ["tail", "-f", "/dev/null"]

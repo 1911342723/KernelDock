@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from .executor import session_manager, DEFAULT_TIMEOUT
 from .services.sandbox_manager import SandboxManager
+from .services.execution_queue import ExecutionQueue
 
 logger = logging.getLogger(__name__)
 
@@ -98,12 +99,19 @@ connection_manager = ConnectionManager()
 
 # 沙箱管理器引用（由 main.py 设置）
 _sandbox_manager: Optional[SandboxManager] = None
+_execution_queue: Optional[ExecutionQueue] = None
 
 
 def set_sandbox_manager(manager: SandboxManager):
     """设置沙箱管理器"""
     global _sandbox_manager
     _sandbox_manager = manager
+
+
+def set_execution_queue(queue: ExecutionQueue):
+    """设置执行队列"""
+    global _execution_queue
+    _execution_queue = queue
 
 
 async def handle_create_session(
@@ -153,22 +161,23 @@ async def handle_execute_code(
 ) -> dict:
     """
     处理代码执行请求
-    
+
     支持实时输出推送（通过定期发送 output 消息）
+    集成执行队列：排队期间每 2 秒推送位置更新
     """
     session_id = data.get("session_id")
     code = data.get("code", "")
     timeout = data.get("timeout", DEFAULT_TIMEOUT)
-    
+
     logger.info(f"[EXECUTE] 收到执行请求: session={session_id}, code_len={len(code)}, timeout={timeout}")
     logger.info(f"[EXECUTE] 代码内容前200字符: {code[:200]}...")
-    
+
     if not session_id:
         raise ValueError("session_id is required")
-    
+
     session = session_manager.get_or_create_session(session_id)
     connection_manager.bind_session(session_id, connection_id)
-    
+
     # 发送开始执行消息
     try:
         await connection_manager.send_message(connection_id, {
@@ -178,7 +187,59 @@ async def handle_execute_code(
         })
     except Exception as e:
         logger.warning(f"[EXECUTE] 无法发送 status 消息: {e}")
-    
+
+    # 如果有执行队列，通过队列控制并发
+    if _execution_queue:
+        ticket = _execution_queue.create_ticket(session_id)
+
+        # 排队期间推送位置更新的后台任务
+        async def push_queue_updates():
+            try:
+                while ticket.status == "queued":
+                    status = _execution_queue.get_queue_status(ticket.ticket_id)
+                    if status and status.status == "queued":
+                        try:
+                            await connection_manager.send_message(connection_id, {
+                                "type": "queue_status",
+                                "id": msg_id,
+                                "data": {
+                                    "position": status.position,
+                                    "estimated_wait_seconds": round(status.estimated_wait_seconds, 1),
+                                    "status": "queued",
+                                }
+                            })
+                        except Exception:
+                            break
+                    await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                pass
+
+        update_task = asyncio.create_task(push_queue_updates())
+        try:
+            async with _execution_queue.acquire_with_ticket(ticket) as t:
+                update_task.cancel()
+                # 发送开始执行通知
+                try:
+                    await connection_manager.send_message(connection_id, {
+                        "type": "queue_status",
+                        "id": msg_id,
+                        "data": {
+                            "status": "executing",
+                            "waited_seconds": round(t.started_at - t.enqueued_at, 2) if t.started_at else 0,
+                        }
+                    })
+                except Exception:
+                    pass
+                result = await _do_execute(session_id, session, code, timeout, websocket, connection_id)
+                return result
+        finally:
+            update_task.cancel()
+    else:
+        return await _do_execute(session_id, session, code, timeout, websocket, connection_id)
+
+
+async def _do_execute(session_id, session, code, timeout, websocket, connection_id):
+    """实际执行代码逻辑（从 handle_execute_code 提取）"""
     # 检查是否使用沙箱
     if _sandbox_manager:
         logger.info(f"[EXECUTE] 检查沙箱管理器...")
@@ -196,27 +257,27 @@ async def handle_execute_code(
             except Exception as e:
                 logger.error(f"Sandbox execution failed: {e}")
                 # 回退到本地执行
-    
+
     # 本地执行
     logger.info(f"[EXECUTE] 使用本地执行模式...")
-    
+
     # 定义输出回调
     async def on_output(text: str):
         await connection_manager.send_message(connection_id, {
             "type": "output",
             "session_id": session_id,
-            "data": {"stdout": text}  # 统一使用 stdout 字段传输日志
+            "data": {"stdout": text}
         })
 
-    import time
-    start_time = time.time()
+    import time as _time
+    start_time = _time.time()
     result = await session.execute_code(
-        code, 
+        code,
         timeout,
         on_stdout=on_output,
         on_stderr=on_output
     )
-    elapsed = time.time() - start_time
+    elapsed = _time.time() - start_time
     logger.info(f"[EXECUTE] 本地执行完成: success={result.get('success')}, elapsed={elapsed:.2f}s")
     logger.info(f"[EXECUTE] 返回结果 keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
     if isinstance(result, dict):

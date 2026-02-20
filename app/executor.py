@@ -155,7 +155,40 @@ class CodeExecutor:
         """
         self._docker_client = docker_client or DockerClient()
         logger.info("代码执行器初始化完成")
-    
+
+    async def _put_file_to_container(
+        self,
+        container_id: str,
+        dest_path: str,
+        content: bytes,
+        user: Optional[str] = None,
+    ) -> None:
+        """
+        通过分块 echo+base64 将文件可靠地写入容器。
+
+        沙箱容器 rootfs 只读（/tmp 是 tmpfs 可写），put_archive API 不可用。
+        原先单次 echo 在代码过长时超过 shell ARG_MAX 导致静默失败。
+        这里将原始字节按 24KB 分块，每块独立 base64 编码后 echo | base64 -d 追加写入。
+        """
+        # 24KB raw = 32KB base64, 远低于 ARG_MAX (~128KB)
+        raw_chunk_size = 24576
+
+        for i in range(0, len(content), raw_chunk_size):
+            chunk = content[i:i + raw_chunk_size]
+            b64_chunk = base64.b64encode(chunk).decode('ascii')
+            op = '>' if i == 0 else '>>'
+            result = await self._docker_client.exec_command(
+                container_id,
+                f"echo '{b64_chunk}' | base64 -d {op} {dest_path}",
+                user=user,
+                timeout=15,
+            )
+            if result.exit_code != 0:
+                logger.error(f"写入脚本分块失败: exit={result.exit_code}, stderr={result.stderr}")
+                raise InternalError(
+                    message=f"脚本文件写入容器失败(chunk {i // raw_chunk_size}): {result.stderr}"
+                )
+
     async def execute_in_container(
         self,
         container_id: str,
@@ -213,16 +246,24 @@ class CodeExecutor:
             script_path = f"/tmp/{script_name}"
             
             # 将代码写入容器内的临时文件
-            # 使用 base64 编码避免特殊字符问题
-            code_b64 = base64.b64encode(full_code.encode('utf-8')).decode('utf-8')
-            write_cmd = f"echo '{code_b64}' | base64 -d > {script_path}"
-            
-            await self._docker_client.exec_command(
-                container_id,
-                write_cmd,
-                user=user,
-                timeout=30
+            # 使用 Docker put_archive API 直接传输文件，避免 shell echo 参数长度限制
+            # （长代码经 base64 编码后可能超过 shell ARG_MAX，导致写入静默失败）
+            await self._put_file_to_container(
+                container_id, script_path, full_code.encode('utf-8'), user=user
             )
+
+            # 验证文件已写入
+            verify_result = await self._docker_client.exec_command(
+                container_id,
+                f"test -f {script_path} && echo OK || echo MISSING",
+                user=user,
+                timeout=5
+            )
+            verify_out = (verify_result.stdout or "").strip()
+            if "OK" not in verify_out:
+                raise InternalError(
+                    message=f"脚本文件写入容器失败: {script_path}"
+                )
             
             # 设置环境变量
             env = {

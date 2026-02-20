@@ -163,7 +163,21 @@ def _register_capture_hooks() -> None:
             # 不调用原始 show（Agg 后端不需要）
         
         def _wrapped_savefig(*args, **kwargs):
-            """包装的 savefig 函数，额外捕获 base64"""
+            """包装的 savefig 函数，重定向相对路径到 OUTPUT_DIR 并捕获 base64"""
+            # 拦截文件路径：将相对路径重定向到 OUTPUT_DIR
+            # 防止 LLM 生成的代码在只读 rootfs 上写文件导致 OSError
+            output_dir = os.environ.get('OUTPUT_DIR', '/output')
+            if args:
+                fname = args[0]
+                if isinstance(fname, str) and not os.path.isabs(fname) and not hasattr(fname, 'write'):
+                    # 相对路径 → 重定向到 OUTPUT_DIR
+                    redirected = os.path.join(output_dir, os.path.basename(fname))
+                    args = (redirected,) + args[1:]
+            elif 'fname' in kwargs:
+                fname = kwargs['fname']
+                if isinstance(fname, str) and not os.path.isabs(fname):
+                    kwargs['fname'] = os.path.join(output_dir, os.path.basename(fname))
+            
             result = _original_savefig(*args, **kwargs)
             
             # 捕获当前 figure 的 base64（不额外写磁盘）

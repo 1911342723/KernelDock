@@ -234,10 +234,63 @@ class SandboxTimeoutConfig(BaseModel):
     )
 
 
+class ExecutionQueueConfig(BaseModel):
+    """
+    执行队列配置
+
+    基于令牌桶的并发控制，限制真实并发执行数匹配 CPU 核心数，
+    避免高并发场景下 CPU 上下文切换导致的性能退化。
+    """
+    max_concurrent_executions: int = Field(
+        default=4,
+        ge=1,
+        le=20,
+        description="最大并发执行数（建议 = CPU 核心数）"
+    )
+    initial_avg_execution_time: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=60.0,
+        description="初始平均执行时间估算(秒)"
+    )
+    queue_timeout: int = Field(
+        default=300,
+        ge=30,
+        le=600,
+        description="排队超时时间(秒)"
+    )
+
+
+class FireAndForgetConfig(BaseModel):
+    """
+    即用即毁执行配置
+
+    无状态执行模式：借容器 → 注入数据 → 执行 → 清理 → 归还容器。
+    """
+    default_timeout: int = Field(
+        default=30,
+        ge=5,
+        le=600,
+        description="默认执行超时（秒）"
+    )
+    max_data_size_mb: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="data_files 总大小上限（MB）"
+    )
+    cleanup_timeout: int = Field(
+        default=10,
+        ge=3,
+        le=60,
+        description="容器清理超时（秒）"
+    )
+
+
 class ContainerPoolConfig(BaseModel):
     """
     容器池配置
-    
+
     定义预热容器池的参数。
     Requirements: 11.4 (支持配置容器池参数)
     """
@@ -307,6 +360,14 @@ class SandboxSettings(BaseSettings):
     security: SandboxSecurityConfig = Field(
         default_factory=SandboxSecurityConfig,
         description="安全配置（gVisor 等）"
+    )
+    queue: ExecutionQueueConfig = Field(
+        default_factory=ExecutionQueueConfig,
+        description="执行队列配置（令牌桶并发控制）"
+    )
+    fire_and_forget: FireAndForgetConfig = Field(
+        default_factory=FireAndForgetConfig,
+        description="即用即毁执行配置"
     )
     
     # 基础配置
