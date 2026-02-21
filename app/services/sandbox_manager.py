@@ -890,6 +890,8 @@ class SandboxManager:
     async def _cleanup_container_workspace(self, container_id: str) -> None:
         """
         清理容器内的 /data、/output、/tmp 目录内容，为下次复用做准备。
+        
+        完全清理所有文件和子目录，确保不同会话之间的数据隔离。
 
         Args:
             container_id: 容器 ID
@@ -904,14 +906,29 @@ class SandboxManager:
             logger.warning(f"检查容器状态失败: {container_id[:12]}, {e}")
             raise
         
-        cleanup_cmd = "rm -rf /data/* /output/* /tmp/*.py /tmp/*.json 2>/dev/null; true"
+        # 使用 find + rm 确保删除所有内容（包括隐藏文件和子目录）
+        # -mindepth 1 确保不删除目录本身
+        cleanup_cmd = (
+            "find /data -mindepth 1 -delete 2>/dev/null; "
+            "find /output -mindepth 1 -delete 2>/dev/null; "
+            "find /tmp -mindepth 1 -name '*.py' -delete 2>/dev/null; "
+            "find /tmp -mindepth 1 -name '*.json' -delete 2>/dev/null; "
+            "find /tmp -mindepth 1 -name '*.csv' -delete 2>/dev/null; "
+            "find /tmp -mindepth 1 -name '*.xlsx' -delete 2>/dev/null; "
+            "true"
+        )
         cleanup_timeout = settings.fire_and_forget.cleanup_timeout
         try:
-            await self._docker_client.exec_command(
+            result = await self._docker_client.exec_command(
                 container_id, cleanup_cmd, timeout=cleanup_timeout
             )
+            logger.info(
+                f"✅ 容器工作空间已清理: {container_id[:12]}, "
+                f"exit_code={result.exit_code}, "
+                f"清理目录: /data, /output, /tmp"
+            )
         except Exception as e:
-            logger.warning(f"清理容器工作空间失败: {container_id[:12]}, {e}")
+            logger.warning(f"⚠️ 清理容器工作空间失败: {container_id[:12]}, {e}")
             raise InternalError(message=f"清理容器工作空间失败: {str(e)}", original_error=e)
 
     async def list_sandboxes(
