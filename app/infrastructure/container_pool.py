@@ -535,7 +535,7 @@ class ContainerPool:
             # 创建容器
             container_info = await self._docker_client.create_container(
                 image=self._image,
-                command="sleep infinity",  # 保持容器运行
+                command=None,  # 使用 Dockerfile CMD（kernel_server）
                 detach=True,
                 **config
             )
@@ -543,17 +543,41 @@ class ContainerPool:
             # 启动容器
             await self._docker_client.start_container(container_info.container_id)
 
-            # 预加载常用库，减少首次执行时的 import 开销
-            try:
-                await self._docker_client.exec_command(
-                    container_info.container_id,
-                    "python -c 'import pandas, numpy, matplotlib, seaborn; print(\"PREWARMED\")'",
-                    timeout=30
+            # 等待容器完全启动（给 kernel_server 时间启动）
+            await asyncio.sleep(2)
+            
+            # 验证容器是否仍在运行
+            is_running = await self._docker_client.is_container_running(container_info.container_id)
+            if not is_running:
+                logger.error(f"容器启动后立即退出: {container_info.container_id[:12]}")
+                # 尝试获取容器日志以诊断问题
+                try:
+                    logs_result = await self._docker_client.exec_command(
+                        container_info.container_id,
+                        "echo 'Container exited'",
+                        timeout=5
+                    )
+                except Exception:
+                    pass
+                raise SandboxCreationError(
+                    reason="容器启动后立即退出，可能是 CMD 失败",
+                    original_error="Container not running after start"
                 )
-                logger.debug(f"预热容器库加载完成: {container_info.container_id[:12]}")
-            except Exception as prewarm_err:
-                # 预加载失败不影响容器可用性
-                logger.warning(f"预热容器库加载失败（不影响使用）: {prewarm_err}")
+
+            # 验证容器健康状态（尝试执行简单命令）
+            try:
+                health_check = await self._docker_client.exec_command(
+                    container_info.container_id,
+                    "python -c 'print(\"OK\")'",
+                    timeout=10
+                )
+                if health_check.exit_code != 0:
+                    logger.warning(f"容器健康检查失败: {container_info.container_id[:12]}, exit_code={health_check.exit_code}")
+            except Exception as health_err:
+                logger.warning(f"容器健康检查异常: {container_info.container_id[:12]}, {health_err}")
+                # 健康检查失败，但容器在运行，可能是 kernel_server 还在启动中
+                # 再等待一会儿
+                await asyncio.sleep(1)
 
             self._total_created += 1
             

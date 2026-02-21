@@ -22,12 +22,39 @@ services:
       - WORKSPACE_DIR=/workspace
       # ---- 沙箱镜像（Dockerfile.sandbox 构建的镜像） ----
       - SANDBOX_DOCKER_IMAGE=code-executor-sandbox:latest
-      # ---- 给真实跑数据分析的沙箱限制 ----
-      - SANDBOX_RESOURCE__DEFAULT_CPU=1.0           # 每个沙箱最多占 1核
-      - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=512       # 每个沙箱物理可用 512MB
-      # ---- 强力压舱石：并发排队与预热池 ----
-      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=4    # 排队机制：最多并发 4 个任务 (4 * 512M = 2G)
-      - SANDBOX_POOL__POOL_SIZE=2                   # 总是保持 2 个待命空热容器 (2 * 512M = 1G)
+      
+      # ============ 资源限制配置（针对4C8G服务器优化） ============
+      # 每个沙箱的资源限制
+      - SANDBOX_RESOURCE__DEFAULT_CPU=1.0              # 每个沙箱最多占 1核
+      - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=256        # 每个沙箱 256MB（提高并发能力）
+      - SANDBOX_RESOURCE__DEFAULT_DISK_MB=1024         # 每个沙箱 1GB 磁盘
+      - SANDBOX_RESOURCE__MAX_CPU=2.0                  # 最大允许 2核
+      - SANDBOX_RESOURCE__MAX_MEMORY_MB=2048           # 最大允许 2GB
+      
+      # ============ 并发控制配置 ============
+      # 令牌桶并发控制：限制真实并发执行数 = CPU核心数
+      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=4     # 最多并发 4 个任务（=4核）
+      - SANDBOX_QUEUE__INITIAL_AVG_EXECUTION_TIME=5.0  # 初始平均执行时间估算
+      - SANDBOX_QUEUE__QUEUE_TIMEOUT=300               # 排队超时 5分钟
+      
+      # ============ 容器池配置 ============
+      # 预热容器池：快速分配容器（<1秒）
+      - SANDBOX_POOL__POOL_SIZE=6                      # 预热容器数量（6 * 256MB = 1.5GB）
+      - SANDBOX_POOL__MAX_CONCURRENT_SANDBOXES=20      # 最大并发沙箱数（20 * 256MB = 5GB）
+      - SANDBOX_POOL__CONTAINER_MAX_AGE_SECONDS=3600   # 容器最大存活 1小时
+      - SANDBOX_POOL__HEALTH_CHECK_INTERVAL=60         # 健康检查间隔 1分钟
+      
+      # ============ 超时配置 ============
+      # 优化超时设置，提高资源利用率
+      - SANDBOX_TIMEOUT__EXECUTION_TIMEOUT=300         # 代码执行超时 5分钟
+      - SANDBOX_TIMEOUT__SESSION_IDLE_TIMEOUT=600      # 会话空闲超时 10分钟（降低以提高并发）
+      - SANDBOX_TIMEOUT__SESSION_MAX_TIMEOUT=43200     # 会话最大时长 12小时
+      - SANDBOX_TIMEOUT__SANDBOX_STARTUP_TIMEOUT=30    # 沙箱启动超时 30秒
+      
+      # ============ Fire-and-Forget 配置（无状态短链接模式） ============
+      - SANDBOX_FIRE_AND_FORGET__DEFAULT_TIMEOUT=30    # 默认执行超时 30秒
+      - SANDBOX_FIRE_AND_FORGET__MAX_DATA_SIZE_MB=50   # 数据文件最大 50MB
+      - SANDBOX_FIRE_AND_FORGET__CLEANUP_TIMEOUT=10    # 清理超时 10秒
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

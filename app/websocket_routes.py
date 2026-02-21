@@ -192,32 +192,43 @@ async def handle_execute_code(
     if _execution_queue:
         ticket = _execution_queue.create_ticket(session_id)
 
-        # 排队期间推送位置更新的后台任务
-        async def push_queue_updates():
+        # 注册排队位置变化回调（实时推送，无需轮询）
+        async def on_position_change(t):
+            """当排队位置变化时自动推送"""
             try:
-                while ticket.status == "queued":
-                    status = _execution_queue.get_queue_status(ticket.ticket_id)
-                    if status and status.status == "queued":
-                        try:
-                            await connection_manager.send_message(connection_id, {
-                                "type": "queue_status",
-                                "id": msg_id,
-                                "data": {
-                                    "position": status.position,
-                                    "estimated_wait_seconds": round(status.estimated_wait_seconds, 1),
-                                    "status": "queued",
-                                }
-                            })
-                        except Exception:
-                            break
-                    await asyncio.sleep(2)
-            except asyncio.CancelledError:
+                await connection_manager.send_message(connection_id, {
+                    "type": "queue_status",
+                    "id": msg_id,
+                    "data": {
+                        "position": t.position,
+                        "estimated_wait_seconds": round(t.estimated_wait_seconds, 1),
+                        "status": "queued",
+                        "message": f"前方还有 {t.position} 个任务，预计等待 {t.estimated_wait_seconds:.0f} 秒"
+                    }
+                })
+                logger.debug(f"[Queue] 推送排队状态: session={session_id}, position={t.position}")
+            except Exception as e:
+                logger.warning(f"[Queue] 推送排队状态失败: {e}")
+
+        _execution_queue.register_position_callback(session_id, on_position_change)
+        
+        try:
+            # 发送初始排队状态
+            try:
+                await connection_manager.send_message(connection_id, {
+                    "type": "queue_status",
+                    "id": msg_id,
+                    "data": {
+                        "position": ticket.position,
+                        "estimated_wait_seconds": round(ticket.estimated_wait_seconds, 1),
+                        "status": "queued",
+                        "message": f"已加入执行队列，前方还有 {ticket.position} 个任务"
+                    }
+                })
+            except Exception:
                 pass
 
-        update_task = asyncio.create_task(push_queue_updates())
-        try:
             async with _execution_queue.acquire_with_ticket(ticket) as t:
-                update_task.cancel()
                 # 发送开始执行通知
                 try:
                     await connection_manager.send_message(connection_id, {
@@ -226,6 +237,7 @@ async def handle_execute_code(
                         "data": {
                             "status": "executing",
                             "waited_seconds": round(t.started_at - t.enqueued_at, 2) if t.started_at else 0,
+                            "message": "开始执行代码"
                         }
                     })
                 except Exception:
@@ -233,7 +245,8 @@ async def handle_execute_code(
                 result = await _do_execute(session_id, session, code, timeout, websocket, connection_id)
                 return result
         finally:
-            update_task.cancel()
+            # 清理回调
+            _execution_queue.unregister_position_callback(session_id)
     else:
         return await _do_execute(session_id, session, code, timeout, websocket, connection_id)
 

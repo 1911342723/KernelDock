@@ -853,6 +853,45 @@ class DockerClient:
             return datetime.fromisoformat(time_str)
         except Exception:
             return datetime.now()
+
+    async def put_archive(
+        self,
+        container_id: str,
+        path: str,
+        data: bytes,
+    ) -> bool:
+        """
+        通过 Docker put_archive API 将 tar 归档写入容器。
+
+        比 echo+base64 分块注入高效得多：单次 API 调用完成全部写入，
+        无需 Base64 编码/解码，无 shell ARG_MAX 限制。
+
+        Args:
+            container_id: 容器 ID
+            path: 容器内的目标目录路径（文件将被解压到此目录）
+            data: tar 格式的归档数据（bytes）
+
+        Returns:
+            是否成功
+
+        Raises:
+            SandboxNotFoundError: 容器不存在
+            InternalError: 写入失败
+        """
+        try:
+            container = await self._get_container(container_id)
+            result = await self._run_in_executor(
+                container.put_archive, path, data
+            )
+            return result
+        except SandboxNotFoundError:
+            raise
+        except Exception as e:
+            logger.debug(f"put_archive 不可用（只读 rootfs）: {e}")
+            raise InternalError(
+                message=f"put_archive 失败: {str(e)}",
+                original_error=e
+            )
     
     async def close(self) -> None:
         """

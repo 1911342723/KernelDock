@@ -135,9 +135,12 @@ pyyaml>=6.0.0,<7.0.0
 adjustText>=0.8,<1.0.0
 EOF
 
+# 引入 uv 包管理器（替代 pip，构建速度提升 10-100 倍）
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 # 安装 Python 依赖到临时目录
-# 使用 --target 将依赖安装到指定目录，便于复制到最终镜像
-RUN pip install --no-cache-dir --target=/build/deps -r requirements.txt
+# 使用 uv 替代 pip 以获得极速的依赖解析和安装
+RUN uv pip install --no-cache-dir --target=/build/deps -r requirements.txt
 
 # ============================================
 # 最终镜像阶段
@@ -167,7 +170,9 @@ ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data \
     OUTPUT_DIR=/output \
     # 设置 HOME 目录为可写目录（某些库需要写入 HOME）
-    HOME=/workspace
+    HOME=/workspace \
+    # Kernel Server 端口（常驻执行进程）
+    KERNEL_PORT=9999
 
 # 安装系统依赖
 # 合并 RUN 命令以减少镜像层数，优化镜像大小
@@ -258,7 +263,11 @@ USER sandbox
 # 设置工作目录
 WORKDIR /workspace
 
-# 容器启动时的默认命令
-# 沙箱容器通常通过 docker exec 执行代码，这里提供一个保持容器运行的命令
-# 使用 tail -f /dev/null 保持容器运行，等待代码执行请求
-CMD ["tail", "-f", "/dev/null"]
+# 暴露 Kernel Server 端口
+EXPOSE 9999
+
+# 容器启动时启动 Kernel Server（常驻代码执行进程）
+# 替代原来的 tail -f /dev/null 空等待模式
+# Kernel Server 保持 Python 命名空间常驻内存，
+# DataFrame 等变量在多次执行间保持不变，性能提升 10-50 倍
+CMD ["python", "-m", "sandbox_runtime.kernel_server"]

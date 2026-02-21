@@ -14,7 +14,7 @@ import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, Dict, Optional
+from typing import AsyncGenerator, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,9 @@ class ExecutionQueue:
         self._total_enqueued = 0
         self._total_executed = 0
         self._total_timed_out = 0
+
+        # 回调函数：当排队位置变化时通知
+        self._position_change_callbacks: Dict[str, Callable] = {}
 
         logger.info(
             f"ExecutionQueue 初始化: max_concurrent={max_concurrent}, "
@@ -239,11 +242,62 @@ class ExecutionQueue:
             "total_timed_out": self._total_timed_out,
         }
 
+    def register_position_callback(
+        self, session_id: str, callback: Callable[[QueueTicket], None]
+    ) -> None:
+        """
+        注册排队位置变化回调
+        
+        当该 session 的排队位置发生变化时，会调用 callback(ticket)
+        
+        Args:
+            session_id: 会话 ID
+            callback: 回调函数，接收 QueueTicket 参数
+        """
+        self._position_change_callbacks[session_id] = callback
+        logger.debug(f"Registered position callback for session {session_id}")
+
+    def unregister_position_callback(self, session_id: str) -> None:
+        """
+        取消注册排队位置变化回调
+        
+        Args:
+            session_id: 会话 ID
+        """
+        if session_id in self._position_change_callbacks:
+            del self._position_change_callbacks[session_id]
+            logger.debug(f"Unregistered position callback for session {session_id}")
+
     def _refresh_positions(self) -> None:
-        """刷新所有等待中 ticket 的位置和预估时间"""
+        """刷新所有等待中 ticket 的位置和预估时间，并触发回调"""
         for idx, ticket in enumerate(self._queue.values()):
+            old_position = ticket.position
             ticket.position = idx + 1
             ticket.estimated_wait_seconds = self._estimate_wait(ticket.position)
+            
+            # 如果位置发生变化，触发回调
+            if old_position != ticket.position:
+                self._notify_position_change(ticket)
+
+    def _notify_position_change(self, ticket: QueueTicket) -> None:
+        """
+        通知排队位置变化
+        
+        Args:
+            ticket: 排队凭证
+        """
+        callback = self._position_change_callbacks.get(ticket.session_id)
+        if callback:
+            try:
+                # 如果是异步回调，创建任务执行
+                if asyncio.iscoroutinefunction(callback):
+                    asyncio.create_task(callback(ticket))
+                else:
+                    callback(ticket)
+            except Exception as e:
+                logger.error(
+                    f"Error in position change callback for session {ticket.session_id}: {e}"
+                )
 
     def _estimate_wait(self, position: int) -> float:
         """预估等待时间 = ceil(position / max_concurrent) * avg_time"""

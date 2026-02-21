@@ -24,10 +24,17 @@ def get_captured_charts() -> List[Dict[str, Any]]:
 
 
 def clear_captured_charts() -> None:
-    """清空已捕获的图表"""
+    """清空已捕获的图表，并关闭所有 matplotlib figures"""
     global _captured_charts, _captured_figure_ids
     _captured_charts = []
     _captured_figure_ids = set()
+    
+    # 关闭所有现有的 matplotlib figures，防止重复捕获
+    try:
+        import matplotlib.pyplot as plt
+        plt.close('all')  # 关闭所有图表
+    except ImportError:
+        pass
 
 
 def save_figure(

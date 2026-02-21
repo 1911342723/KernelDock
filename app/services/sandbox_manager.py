@@ -409,30 +409,14 @@ class SandboxManager:
             # 创建工作空间目录
             data_dir, output_dir = self._create_workspace_dirs(sandbox_id)
             
-            # 尝试从容器池获取预热容器
-            # Requirements 7.2: 在 1 秒内分配预热容器
-            container_id = None
-            if self._container_pool and self._container_pool.available_count > 0:
-                pooled = await self._container_pool.acquire()
-                if pooled:
-                    container_id = pooled.container_id
-                    logger.info(f"使用预热容器: {container_id[:12]}")
-                    # 需要重新配置容器（预热容器使用默认配置）
-                    # 由于 Docker 不支持修改运行中容器的资源限制，
-                    # 我们需要停止并重新创建容器
-                    await self._docker_client.stop_container(container_id, timeout=5)
-                    await self._docker_client.remove_container(container_id, force=True)
-                    container_id = None  # 重新创建
-            
-            # 如果没有预热容器，创建新容器
-            if container_id is None:
-                container_id = await self._create_container(
-                    sandbox_id=sandbox_id,
-                    resource_limits=resource_limits,
-                    network_policy=network_policy,
-                    data_dir=data_dir,
-                    output_dir=output_dir
-                )
+            # 创建新容器（不使用预热容器池，因为有状态会话需要自定义配置）
+            container_id = await self._create_container(
+                sandbox_id=sandbox_id,
+                resource_limits=resource_limits,
+                network_policy=network_policy,
+                data_dir=data_dir,
+                output_dir=output_dir
+            )
             
             # 创建沙箱信息
             now = datetime.now()
@@ -771,7 +755,7 @@ class SandboxManager:
 
         container_info = await self._docker_client.create_container(
             image=self._docker_image,
-            command="sleep infinity",
+            command=None,  # 使用 Dockerfile CMD（kernel_server）
             detach=True,
             network_mode="none",
             tmpfs=tmpfs_config,
@@ -807,34 +791,79 @@ class SandboxManager:
         """
         将 base64 编码的数据文件注入容器的 /data 目录。
 
-        使用分块写入避免单次 echo 超过 shell ARG_MAX (~128KB) 限制。
-        与 CodeExecutor._put_file_to_container 使用相同的 24KB 分块策略。
+        优先使用 Docker put_archive API（单次 tar 传输，零 Base64 分块损耗）；
+        如果 put_archive 失败，回退到分块 echo+base64。
 
         Args:
             container_id: 容器 ID
             data_files: {filename: base64_content}
         """
         import base64 as b64
+        import tarfile
+        import io
 
-        # 24KB raw = ~32KB base64, 远低于 ARG_MAX (~128KB)
+        logger.info(f"[数据注入] 开始注入 {len(data_files)} 个文件到容器 {container_id[:12]}")
+        for fname in data_files.keys():
+            logger.info(f"[数据注入] 文件: {fname}, base64长度: {len(data_files[fname])}")
+
+        # --- 优先方案：将所有文件打包为 tar 一次性传输 ---
+        try:
+            tar_stream = io.BytesIO()
+            total_size = 0
+            file_count = 0
+
+            with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+                for filename, b64_content in data_files.items():
+                    safe_name = os.path.basename(filename)
+                    if not safe_name:
+                        continue
+
+                    try:
+                        raw_data = b64.b64decode(b64_content)
+                    except Exception as e:
+                        logger.warning(f"解码数据文件失败: {safe_name}, {e}")
+                        continue
+
+                    info = tarfile.TarInfo(name=safe_name)
+                    info.size = len(raw_data)
+                    info.mode = 0o644
+                    info.uid = 1000
+                    info.gid = 1000
+                    tar.addfile(info, io.BytesIO(raw_data))
+                    total_size += len(raw_data)
+                    file_count += 1
+
+            tar_stream.seek(0)
+
+            await self._docker_client.put_archive(
+                container_id, "/data", tar_stream.read()
+            )
+
+            logger.debug(
+                f"put_archive 注入 {file_count} 个数据文件 "
+                f"({total_size} bytes) -> {container_id[:12]}"
+            )
+            return
+
+        except Exception as e:
+            logger.debug(f"put_archive 不可用（预期行为：只读 rootfs），使用 echo+base64: {e}")
+
+        # --- 回退方案：分块 echo+base64 ---
         RAW_CHUNK_SIZE = 24576
 
         for filename, b64_content in data_files.items():
-            # 安全检查：文件名不能包含路径分隔符
             safe_name = os.path.basename(filename)
             if not safe_name:
                 continue
 
             target_path = f"/data/{safe_name}"
 
-            # 先将 base64 解码为原始字节
             try:
                 raw_data = b64.b64decode(b64_content)
             except Exception as e:
                 logger.warning(f"解码数据文件失败: {safe_name}, {e}")
                 continue
 
-            # 分块写入：每块 24KB raw → base64 编码 → echo | base64 -d >> file
             for i in range(0, len(raw_data), RAW_CHUNK_SIZE):
                 chunk = raw_data[i:i + RAW_CHUNK_SIZE]
                 b64_chunk = b64.b64encode(chunk).decode('ascii')
@@ -853,7 +882,7 @@ class SandboxManager:
                     break
 
             logger.debug(
-                f"注入数据文件: {safe_name} ({len(raw_data)} bytes, "
+                f"echo+base64 注入数据文件: {safe_name} ({len(raw_data)} bytes, "
                 f"{(len(raw_data) - 1) // RAW_CHUNK_SIZE + 1} chunks) "
                 f"-> {container_id[:12]}"
             )
@@ -865,6 +894,16 @@ class SandboxManager:
         Args:
             container_id: 容器 ID
         """
+        # 先检查容器是否正在运行
+        try:
+            is_running = await self._docker_client.is_container_running(container_id)
+            if not is_running:
+                logger.warning(f"容器未运行，跳过清理: {container_id[:12]}")
+                raise InternalError(message=f"容器 {container_id[:12]} 未运行")
+        except Exception as e:
+            logger.warning(f"检查容器状态失败: {container_id[:12]}, {e}")
+            raise
+        
         cleanup_cmd = "rm -rf /data/* /output/* /tmp/*.py /tmp/*.json 2>/dev/null; true"
         cleanup_timeout = settings.fire_and_forget.cleanup_timeout
         try:
@@ -873,6 +912,7 @@ class SandboxManager:
             )
         except Exception as e:
             logger.warning(f"清理容器工作空间失败: {container_id[:12]}, {e}")
+            raise InternalError(message=f"清理容器工作空间失败: {str(e)}", original_error=e)
 
     async def list_sandboxes(
         self,
@@ -1071,7 +1111,7 @@ class SandboxManager:
         container_info = await self._docker_client.create_container(
             image=self._docker_image,
             name=f"sandbox-{sandbox_id[:8]}",
-            command="sleep infinity",  # 保持容器运行
+            command=None,  # 使用 Dockerfile CMD（kernel_server）
             labels=labels,
             volumes=volumes,
             network_mode=network_mode,
