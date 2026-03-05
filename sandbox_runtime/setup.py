@@ -18,6 +18,7 @@ from typing import Optional
 _data_dir: str = os.environ.get('DATA_DIR', '/data')
 _output_dir: str = os.environ.get('OUTPUT_DIR', '/output')
 _initialized: bool = False
+_selected_font: Optional[str] = None
 
 
 def get_data_dir() -> str:
@@ -28,6 +29,14 @@ def get_data_dir() -> str:
 def get_output_dir() -> str:
     """获取输出目录路径"""
     return _output_dir
+
+
+def get_font_info() -> dict:
+    """获取当前 matplotlib 字体配置信息"""
+    return {
+        'selected_font': _selected_font,
+        'font_sans_serif': os.environ.get('MPL_FONT_SANS_SERIF', ''),
+    }
 
 
 def setup(
@@ -88,6 +97,7 @@ def _setup_encoding() -> None:
 
 def _setup_matplotlib() -> None:
     """配置 Matplotlib"""
+    global _selected_font
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -138,6 +148,8 @@ def _setup_matplotlib() -> None:
             (f for f in chinese_fonts if f in available_fonts),
             'DejaVu Sans'
         )
+        _selected_font = selected_font
+        os.environ['MPL_FONT_SANS_SERIF'] = ','.join([selected_font, 'DejaVu Sans', 'Arial'])
         print(f"[Font] Selected: {selected_font}")
         
         # 应用字体配置

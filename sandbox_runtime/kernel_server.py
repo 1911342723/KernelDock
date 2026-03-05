@@ -175,6 +175,13 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
         sys.stdout = captured_out
         sys.stderr = captured_err
         try:
+            try:
+                from sandbox_runtime.setup import get_font_info
+                font_info = get_font_info()
+                print(f"[Font] Selected: {font_info.get('selected_font')}")
+                print(f"[Font] Sans-serif: {font_info.get('font_sans_serif')}")
+            except Exception:
+                pass
             exec(code, _namespace)
             # 备份图表捕获
             exec(BACKUP_CAPTURE_CODE, _namespace)
