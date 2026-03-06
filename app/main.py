@@ -193,6 +193,45 @@ class TableData(BaseModel):
     csvData: Optional[str]
 
 
+class QueueInfoResponse(BaseModel):
+    """排队信息"""
+    position_on_entry: int = 0
+    waited_seconds: float = 0.0
+    estimated_wait_seconds: float = 0.0
+    queue_depth: int = 0
+    executing_count: int = 0
+    max_concurrent: int = 0
+    avg_execution_time: float = 0.0
+    total_enqueued: int = 0
+    total_executed: int = 0
+
+
+class SandboxInfoResponse(BaseModel):
+    """沙箱运行信息"""
+    sandbox_id: Optional[str] = None
+    container_id_short: Optional[str] = None
+    mode: str = "unknown"
+    state: Optional[str] = None
+    cpu_limit: Optional[float] = None
+    memory_limit_mb: Optional[int] = None
+    network_enabled: Optional[bool] = None
+    pool_available: Optional[int] = None
+    pool_total: Optional[int] = None
+
+
+class ExecutionInfoResponse(BaseModel):
+    """执行细节信息"""
+    execution_time_ms: int = 0
+    execution_path: str = "unknown"
+    code_size_bytes: int = 0
+    timeout_configured: int = 0
+    timed_out: bool = False
+    chart_count: int = 0
+    table_count: int = 0
+    output_truncated: bool = False
+    output_size_bytes: int = 0
+
+
 class ExecuteCodeResponse(BaseModel):
     """执行代码响应"""
     success: bool
@@ -203,7 +242,9 @@ class ExecuteCodeResponse(BaseModel):
     tables: List[dict]
     images: List[str]
     error: Optional[str]
-    queue_info: Optional[dict] = None
+    queue_info: Optional[QueueInfoResponse] = None
+    sandbox_info: Optional[SandboxInfoResponse] = None
+    execution_info: Optional[ExecutionInfoResponse] = None
 
 
 class StatelessExecuteRequest(BaseModel):
@@ -410,6 +451,80 @@ async def delete_session(session_id: str):
 # ===== 代码执行 API =====
 # Requirements 10.4: 支持现有的代码执行 API（execute）
 
+def _build_queue_info(ticket) -> QueueInfoResponse:
+    """Build QueueInfoResponse from a QueueTicket and global queue state."""
+    waited = 0.0
+    if ticket.started_at:
+        waited = round(ticket.started_at - ticket.enqueued_at, 2)
+    global_status = _execution_queue.get_global_status() if _execution_queue else {}
+    return QueueInfoResponse(
+        position_on_entry=ticket.position,
+        waited_seconds=waited,
+        estimated_wait_seconds=round(ticket.estimated_wait_seconds, 2),
+        queue_depth=global_status.get("queued_count", 0),
+        executing_count=global_status.get("executing_count", 0),
+        max_concurrent=global_status.get("max_concurrent", 0),
+        avg_execution_time=global_status.get("avg_execution_time", 0),
+        total_enqueued=global_status.get("total_enqueued", 0),
+        total_executed=global_status.get("total_executed", 0),
+    )
+
+
+async def _build_sandbox_info(
+    session_id: str,
+    *,
+    mode: str = "unknown",
+    sandbox_info_obj=None,
+) -> SandboxInfoResponse:
+    """Build SandboxInfoResponse from SandboxManager state."""
+    pool_available = None
+    pool_total = None
+    if _sandbox_manager and _sandbox_manager._container_pool:
+        pool_available = _sandbox_manager._container_pool.available_count
+        pool_total = _sandbox_manager._container_pool.pool_size
+
+    if sandbox_info_obj:
+        return SandboxInfoResponse(
+            sandbox_id=sandbox_info_obj.sandbox_id,
+            container_id_short=sandbox_info_obj.container_id[:12] if sandbox_info_obj.container_id else None,
+            mode=mode,
+            state=sandbox_info_obj.state.value if sandbox_info_obj.state else None,
+            cpu_limit=sandbox_info_obj.cpu_limit,
+            memory_limit_mb=sandbox_info_obj.memory_limit_mb,
+            network_enabled=sandbox_info_obj.network_enabled,
+            pool_available=pool_available,
+            pool_total=pool_total,
+        )
+
+    return SandboxInfoResponse(
+        mode=mode,
+        pool_available=pool_available,
+        pool_total=pool_total,
+    )
+
+
+def _build_execution_info(
+    result: dict,
+    *,
+    code: str,
+    timeout: int,
+    execution_path: str = "unknown",
+) -> ExecutionInfoResponse:
+    """Build ExecutionInfoResponse from the raw execution result dict."""
+    output_text = result.get("output", "")
+    return ExecutionInfoResponse(
+        execution_time_ms=result.get("execution_time_ms", 0),
+        execution_path=execution_path,
+        code_size_bytes=len(code.encode("utf-8")),
+        timeout_configured=timeout,
+        timed_out="超时" in result.get("error", "") if result.get("error") else False,
+        chart_count=len(result.get("charts", [])),
+        table_count=len(result.get("tables", [])),
+        output_truncated=output_text.endswith("(输出已截断)"),
+        output_size_bytes=len(output_text.encode("utf-8")),
+    )
+
+
 @app.post("/sessions/{session_id}/execute", response_model=ExecuteCodeResponse)
 async def execute_code(session_id: str, request: ExecuteCodeRequest):
     """
@@ -423,24 +538,30 @@ async def execute_code(session_id: str, request: ExecuteCodeRequest):
     """
     session = session_manager.get_or_create_session(session_id)
 
-    # 更新会话活动时间
     if _session_store:
         await _session_store.update_activity(session_id)
 
     if _execution_queue:
-        # 通过执行队列控制并发
         async with _execution_queue.acquire(session_id) as ticket:
-            result = await _do_execute_code(session_id, session, request)
-            # 注入排队信息
-            if isinstance(result, dict) and ticket.started_at:
-                result["queue_info"] = {
-                    "waited_seconds": round(ticket.started_at - ticket.enqueued_at, 2),
-                    "queue_position_on_entry": ticket.position,
-                }
-            return ExecuteCodeResponse(**result) if isinstance(result, dict) else result
+            result, exec_path, sb_info = await _do_execute_code(session_id, session, request)
+            queue_info = _build_queue_info(ticket)
+            sandbox_info = await _build_sandbox_info(session_id, mode=exec_path, sandbox_info_obj=sb_info)
+            exec_info = _build_execution_info(result, code=request.code, timeout=request.timeout, execution_path=exec_path)
+            if isinstance(result, dict):
+                result["queue_info"] = queue_info
+                result["sandbox_info"] = sandbox_info
+                result["execution_info"] = exec_info
+                return ExecuteCodeResponse(**result)
+            return result
     else:
-        result = await _do_execute_code(session_id, session, request)
-        return ExecuteCodeResponse(**result) if isinstance(result, dict) else result
+        result, exec_path, sb_info = await _do_execute_code(session_id, session, request)
+        sandbox_info = await _build_sandbox_info(session_id, mode=exec_path, sandbox_info_obj=sb_info)
+        exec_info = _build_execution_info(result, code=request.code, timeout=request.timeout, execution_path=exec_path)
+        if isinstance(result, dict):
+            result["sandbox_info"] = sandbox_info
+            result["execution_info"] = exec_info
+            return ExecuteCodeResponse(**result)
+        return result
 
 
 async def _do_execute_code(session_id: str, session, request: ExecuteCodeRequest):
@@ -448,22 +569,24 @@ async def _do_execute_code(session_id: str, session, request: ExecuteCodeRequest
     Execute code via SandboxManager (Docker) when available, otherwise fall
     back to local subprocess execution through StatelessSession.
 
-    Container lifecycle is owned solely by SandboxManager; StatelessSession
-    is only used for the local fallback path.
+    Returns:
+        (result_dict, execution_path, sandbox_info_obj_or_None)
     """
     if _sandbox_manager:
         sandbox_info = await _sandbox_manager.get_sandbox_by_session(session_id)
         if sandbox_info:
             try:
-                return await _sandbox_manager.execute_code(
+                result = await _sandbox_manager.execute_code(
                     sandbox_id=sandbox_info.sandbox_id,
                     code=request.code,
                     timeout=request.timeout,
                 )
+                return result, "sandbox_kernel", sandbox_info
             except Exception as e:
                 logger.error(f"沙箱执行失败，回退到本地执行: {e}")
 
-    return await session.execute_code(request.code, request.timeout)
+    result = await session.execute_code(request.code, request.timeout)
+    return result, "local_subprocess", None
 
 
 @app.post("/sessions/{session_id}/load-data", response_model=LoadDataResponse)
@@ -785,7 +908,6 @@ async def execute_stateless(request: StatelessExecuteRequest):
         timeout: 执行超时（秒，默认 30）
         data_files: 数据文件字典 {filename: base64_content}（可选）
     """
-    # 校验 data_files 总大小
     if request.data_files:
         total_size = sum(len(v) for v in request.data_files.values())
         max_size = settings.fire_and_forget.max_data_size_mb * 1024 * 1024
@@ -795,43 +917,48 @@ async def execute_stateless(request: StatelessExecuteRequest):
                 detail=f"数据文件总大小超过限制（{settings.fire_and_forget.max_data_size_mb}MB）"
             )
 
+    exec_path = "unknown"
+
     async def _do_execute():
-        # 优先使用沙箱管理器
+        nonlocal exec_path
         if _sandbox_manager:
+            exec_path = "stateless_pool_kernel"
             return await _sandbox_manager.execute_stateless(
                 code=request.code,
                 data_files=request.data_files,
                 timeout=request.timeout,
             )
 
-        # 回退到本地执行
         logger.info("沙箱管理器不可用，使用本地执行模式")
-        import uuid
-        tmp_session_id = f"stateless-{uuid.uuid4().hex[:8]}"
+        exec_path = "local_subprocess"
+        import uuid as _uuid
+        tmp_session_id = f"stateless-{_uuid.uuid4().hex[:8]}"
         tmp_session = session_manager.create_session(tmp_session_id)
         try:
-            # 注入 data_files 到本地 session
             if request.data_files:
                 for fname, b64_content in request.data_files.items():
                     file_bytes = base64.b64decode(b64_content)
                     await tmp_session.load_file(file_bytes, fname)
-
-            result = await tmp_session.execute_code(request.code, request.timeout)
-            return result
+            return await tmp_session.execute_code(request.code, request.timeout)
         finally:
             session_manager.delete_session(tmp_session_id)
 
     if _execution_queue:
         async with _execution_queue.acquire("stateless") as ticket:
             result = await _do_execute()
-            if ticket.started_at:
-                result["queue_info"] = {
-                    "waited_seconds": round(ticket.started_at - ticket.enqueued_at, 2),
-                    "queue_position_on_entry": ticket.position,
-                }
+            queue_info = _build_queue_info(ticket)
+            sandbox_info = await _build_sandbox_info("stateless", mode=exec_path)
+            exec_info = _build_execution_info(result, code=request.code, timeout=request.timeout, execution_path=exec_path)
+            result["queue_info"] = queue_info
+            result["sandbox_info"] = sandbox_info
+            result["execution_info"] = exec_info
             return ExecuteCodeResponse(**result)
     else:
         result = await _do_execute()
+        sandbox_info = await _build_sandbox_info("stateless", mode=exec_path)
+        exec_info = _build_execution_info(result, code=request.code, timeout=request.timeout, execution_path=exec_path)
+        result["sandbox_info"] = sandbox_info
+        result["execution_info"] = exec_info
         return ExecuteCodeResponse(**result)
 
 
