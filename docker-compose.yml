@@ -7,8 +7,11 @@ services:
       dockerfile: Dockerfile
     image: code-executor:latest
     container_name: code-executor
-    # 网关需要访问 Docker socket 管理沙箱子容器，必须以 root 运行
-    # 安全隔离由沙箱容器自身保证（非 root + 只读 rootfs + gVisor）
+    # Gateway needs Docker socket access to manage sandbox containers.
+    # Production recommendation: use rootless Docker or a Docker socket
+    # proxy (e.g. tecnativa/docker-socket-proxy) to limit API surface.
+    # Security isolation is enforced by sandbox containers themselves
+    # (non-root + read-only rootfs + network=none + optional gVisor).
     user: root
     ports:
       - "8080:8080"
@@ -32,13 +35,13 @@ services:
       - SANDBOX_RESOURCE__MAX_MEMORY_MB=2048           # 最大允许 2GB
       
       # ============ 并发控制配置 ============
-      # 令牌桶并发控制：限制真实并发执行数 = CPU核心数
-      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=4     # 最多并发 4 个任务（=4核）
-      - SANDBOX_QUEUE__INITIAL_AVG_EXECUTION_TIME=5.0  # 初始平均执行时间估算
-      - SANDBOX_QUEUE__QUEUE_TIMEOUT=300               # 排队超时 5分钟
+      # Semaphore limit should match pool_size so every warm container can
+      # serve a request concurrently (each kernel_server is single-threaded).
+      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=6     # = pool_size
+      - SANDBOX_QUEUE__INITIAL_AVG_EXECUTION_TIME=5.0
+      - SANDBOX_QUEUE__QUEUE_TIMEOUT=300
       
       # ============ 容器池配置 ============
-      # 预热容器池：快速分配容器（<1秒）
       - SANDBOX_POOL__POOL_SIZE=6                      # 预热容器数量（6 * 256MB = 1.5GB）
       - SANDBOX_POOL__MAX_CONCURRENT_SANDBOXES=20      # 最大并发沙箱数（20 * 256MB = 5GB）
       - SANDBOX_POOL__CONTAINER_MAX_AGE_SECONDS=3600   # 容器最大存活 1小时
@@ -55,6 +58,12 @@ services:
       - SANDBOX_FIRE_AND_FORGET__DEFAULT_TIMEOUT=30    # 默认执行超时 30秒
       - SANDBOX_FIRE_AND_FORGET__MAX_DATA_SIZE_MB=50   # 数据文件最大 50MB
       - SANDBOX_FIRE_AND_FORGET__CLEANUP_TIMEOUT=10    # 清理超时 10秒
+      
+      # ============ 安全配置 ============
+      # CORS: 生产环境应设置为实际前端域名，逗号分隔
+      # 例如: CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+      # 留空则使用 "*"（仅开发环境）
+      - CORS_ALLOWED_ORIGINS=
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

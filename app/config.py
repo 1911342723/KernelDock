@@ -238,14 +238,15 @@ class ExecutionQueueConfig(BaseModel):
     """
     执行队列配置
 
-    基于令牌桶的并发控制，限制真实并发执行数匹配 CPU 核心数，
-    避免高并发场景下 CPU 上下文切换导致的性能退化。
+    基于令牌桶的并发控制。由于 Kernel Server 是单线程的，每个容器
+    同时只能处理一个请求，因此 max_concurrent 应与容器池大小对齐，
+    使每个预热容器都能同时服务一个请求。
     """
     max_concurrent_executions: int = Field(
-        default=4,
+        default=6,
         ge=1,
-        le=20,
-        description="最大并发执行数（建议 = CPU 核心数）"
+        le=50,
+        description="最大并发执行数（建议 = 容器池大小）"
     )
     initial_avg_execution_time: float = Field(
         default=5.0,

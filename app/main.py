@@ -116,14 +116,14 @@ async def lifespan(app: FastAPI):
     if _health_monitor:
         await _health_monitor.stop_background_monitoring()
     
-    # 关闭沙箱管理器
+    # SandboxManager owns all container lifecycle; shut it down first
     if _sandbox_manager:
         await _sandbox_manager.shutdown()
         _sandbox_manager = None
     
-    # 清理所有会话（兼容旧的 session_manager）
-    for session_id in list(session_manager.sessions.keys()):
-        session_manager.delete_session(session_id)
+    # Clean local file-management sessions (workspace dirs)
+    for sid in list(session_manager.sessions.keys()):
+        session_manager.delete_session(sid)
     
     logger.info("Code Executor Service 已关闭")
 
@@ -135,10 +135,12 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS 配置
+# CORS: restrict to known origins via env var; fall back to permissive only in dev.
+_cors_origins_raw = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -338,15 +340,9 @@ async def create_session(request: CreateSessionRequest):
             logger.warning(f"创建沙箱失败，回退到本地模式: {e}")
             sandbox_info = None
     
-    # 创建兼容的 StatelessSession（用于文件管理等）
+    # StatelessSession is only used for local file management (schemas, data loading).
+    # Container lifecycle is managed exclusively by SandboxManager.
     session = session_manager.create_session(session_id)
-    
-    # 如果有沙箱，设置容器信息
-    if sandbox_info and _sandbox_manager:
-        session.set_container(
-            sandbox_info.container_id,
-            _sandbox_manager._docker_client
-        )
     
     return CreateSessionResponse(
         session_id=session.session_id,
@@ -393,17 +389,17 @@ async def delete_session(session_id: str):
     
     Requirements 10.1, 10.3: 保持现有 API 接口格式不变
     """
-    # 删除沙箱（如果有）
+    # 1. Destroy sandbox container (SandboxManager owns container lifecycle)
     if _sandbox_manager:
         sandbox_info = await _sandbox_manager.get_sandbox_by_session(session_id)
         if sandbox_info:
             await _sandbox_manager.destroy_sandbox(sandbox_info.sandbox_id)
     
-    # 删除会话存储中的记录
+    # 2. Remove from session metadata store
     if _session_store:
         await _session_store.delete_session(session_id)
     
-    # 删除兼容的 StatelessSession
+    # 3. Clean local workspace files via StatelessSession
     success = session_manager.delete_session(session_id)
     if not success:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -448,26 +444,26 @@ async def execute_code(session_id: str, request: ExecuteCodeRequest):
 
 
 async def _do_execute_code(session_id: str, session, request: ExecuteCodeRequest):
-    """实际执行代码逻辑（从 execute_code 提取）"""
-    # 检查是否有沙箱
+    """
+    Execute code via SandboxManager (Docker) when available, otherwise fall
+    back to local subprocess execution through StatelessSession.
+
+    Container lifecycle is owned solely by SandboxManager; StatelessSession
+    is only used for the local fallback path.
+    """
     if _sandbox_manager:
         sandbox_info = await _sandbox_manager.get_sandbox_by_session(session_id)
         if sandbox_info:
-            # 使用沙箱管理器执行代码
             try:
-                result = await _sandbox_manager.execute_code(
+                return await _sandbox_manager.execute_code(
                     sandbox_id=sandbox_info.sandbox_id,
                     code=request.code,
-                    timeout=request.timeout
+                    timeout=request.timeout,
                 )
-                return result
             except Exception as e:
-                logger.error(f"沙箱执行失败: {e}")
-                # 回退到本地执行
+                logger.error(f"沙箱执行失败，回退到本地执行: {e}")
 
-    # 使用本地执行（兼容模式）
-    result = await session.execute_code(request.code, request.timeout)
-    return result
+    return await session.execute_code(request.code, request.timeout)
 
 
 @app.post("/sessions/{session_id}/load-data", response_model=LoadDataResponse)

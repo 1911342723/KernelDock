@@ -680,7 +680,7 @@ class SandboxManager:
         from ..executor import CodeExecutor
 
         if not self._container_pool:
-            raise InternalError(reason="容器池未初始化")
+            raise InternalError(message="容器池未初始化")
 
         # 1. 从池中借一个容器
         pooled = await self._container_pool.acquire_for_execution()
@@ -707,8 +707,9 @@ class SandboxManager:
                 timeout=timeout,
             )
 
-            # 4. 清理容器工作空间
+            # 4. 清理container workspace and reset kernel namespace
             await self._cleanup_container_workspace(container_id)
+            await self._reset_kernel_namespace(container_id)
 
             # 5. 归还容器
             await self._container_pool.release(container_id)
@@ -889,32 +890,32 @@ class SandboxManager:
 
     async def _cleanup_container_workspace(self, container_id: str) -> None:
         """
-        清理容器内的 /data、/output、/tmp 目录内容，为下次复用做准备。
-        
-        完全清理所有文件和子目录，确保不同会话之间的数据隔离。
+        清理容器内所有可写挂载点的内容，为下次复用做准备。
+
+        覆盖 /data, /output, /tmp, /var/tmp, /run, /home/sandbox 等
+        tmpfs 和 bind-mount 目录，防止跨用户数据泄漏。
 
         Args:
             container_id: 容器 ID
         """
-        # 先检查容器是否正在运行
         try:
             is_running = await self._docker_client.is_container_running(container_id)
             if not is_running:
                 logger.warning(f"容器未运行，跳过清理: {container_id[:12]}")
                 raise InternalError(message=f"容器 {container_id[:12]} 未运行")
+        except InternalError:
+            raise
         except Exception as e:
             logger.warning(f"检查容器状态失败: {container_id[:12]}, {e}")
             raise
-        
-        # 使用 find + rm 确保删除所有内容（包括隐藏文件和子目录）
-        # -mindepth 1 确保不删除目录本身
+
         cleanup_cmd = (
             "find /data -mindepth 1 -delete 2>/dev/null; "
             "find /output -mindepth 1 -delete 2>/dev/null; "
-            "find /tmp -mindepth 1 -name '*.py' -delete 2>/dev/null; "
-            "find /tmp -mindepth 1 -name '*.json' -delete 2>/dev/null; "
-            "find /tmp -mindepth 1 -name '*.csv' -delete 2>/dev/null; "
-            "find /tmp -mindepth 1 -name '*.xlsx' -delete 2>/dev/null; "
+            "find /tmp -mindepth 1 -delete 2>/dev/null; "
+            "find /var/tmp -mindepth 1 -delete 2>/dev/null; "
+            "find /run -mindepth 1 -delete 2>/dev/null; "
+            "find /home/sandbox -mindepth 1 -delete 2>/dev/null; "
             "true"
         )
         cleanup_timeout = settings.fire_and_forget.cleanup_timeout
@@ -923,13 +924,46 @@ class SandboxManager:
                 container_id, cleanup_cmd, timeout=cleanup_timeout
             )
             logger.info(
-                f"✅ 容器工作空间已清理: {container_id[:12]}, "
+                f"容器工作空间已清理: {container_id[:12]}, "
                 f"exit_code={result.exit_code}, "
-                f"清理目录: /data, /output, /tmp"
+                f"清理目录: /data, /output, /tmp, /var/tmp, /run, /home/sandbox"
             )
         except Exception as e:
-            logger.warning(f"⚠️ 清理容器工作空间失败: {container_id[:12]}, {e}")
+            logger.warning(f"清理容器工作空间失败: {container_id[:12]}, {e}")
             raise InternalError(message=f"清理容器工作空间失败: {str(e)}", original_error=e)
+
+    async def _reset_kernel_namespace(self, container_id: str) -> None:
+        """
+        Reset the Kernel Server namespace inside the container to prevent
+        cross-user variable leakage in stateless execution mode.
+
+        Sends a reset request via kernel_relay. Failures are logged but
+        do not prevent container reuse.
+        """
+        try:
+            reset_cmd = (
+                'python -c "'
+                "import socket,json;"
+                "s=socket.socket();"
+                "s.connect(('127.0.0.1',9999));"
+                "p=json.dumps({'action':'reset'}).encode();"
+                "s.sendall(len(p).to_bytes(4,'big')+p);"
+                "s.recv(4096);"
+                "s.close()"
+                '"'
+            )
+            result = await self._docker_client.exec_command(
+                container_id, reset_cmd, timeout=10
+            )
+            if result.exit_code == 0:
+                logger.debug(f"Kernel namespace reset: {container_id[:12]}")
+            else:
+                logger.warning(
+                    f"Kernel namespace reset failed: {container_id[:12]}, "
+                    f"exit={result.exit_code}"
+                )
+        except Exception as e:
+            logger.warning(f"Kernel namespace reset error: {container_id[:12]}, {e}")
 
     async def list_sandboxes(
         self,

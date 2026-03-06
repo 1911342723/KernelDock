@@ -299,6 +299,39 @@ class ExecutionQueue:
                     f"Error in position change callback for session {ticket.session_id}: {e}"
                 )
 
+    async def resize(self, new_max_concurrent: int) -> None:
+        """
+        Dynamically adjust the concurrency limit to match available resources
+        (e.g. container pool size changes).
+
+        Increasing the limit releases extra permits immediately; decreasing
+        it takes effect as existing permits are returned.
+        """
+        if new_max_concurrent < 1:
+            new_max_concurrent = 1
+
+        async with self._lock:
+            old = self._max_concurrent
+            if new_max_concurrent == old:
+                return
+
+            delta = new_max_concurrent - old
+            self._max_concurrent = new_max_concurrent
+
+            if delta > 0:
+                for _ in range(delta):
+                    self._semaphore.release()
+            else:
+                for _ in range(-delta):
+                    try:
+                        self._semaphore.acquire_nowait()
+                    except Exception:
+                        break
+
+            self._refresh_positions()
+
+        logger.info(f"[Queue] 并发限制调整: {old} -> {new_max_concurrent}")
+
     def _estimate_wait(self, position: int) -> float:
         """预估等待时间 = ceil(position / max_concurrent) * avg_time"""
         import math

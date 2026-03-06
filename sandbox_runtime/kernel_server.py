@@ -16,11 +16,12 @@ Kernel Server — 容器内常驻的轻量级代码执行进程
 
 安全说明：
     - 每个容器对应唯一 session，命名空间不会跨 session 共享
-    - 超时由 signal.alarm + threading 双重保障
+    - 超时通过 multiprocessing.Process + terminate 强制终止
     - 异常不会终止 server 进程
 """
 
 import base64
+import ctypes
 import io
 import json
 import os
@@ -48,7 +49,6 @@ def _init_namespace() -> None:
     if _initialized:
         return
 
-    # 初始化沙箱运行时环境
     init_code = """
 import os
 os.environ.setdefault('DATA_DIR', '/data')
@@ -97,20 +97,41 @@ def reset_namespace() -> None:
 
 # ========== 代码执行 ==========
 
-# 用于从 stdout 提取图表/表格标记的正则
 SVG_PATTERN = re.compile(r'SVG_BASE64_START:(.+?):SVG_BASE64_END', re.DOTALL)
 TABLE_PATTERN = re.compile(r'TABLE_DATA_START:(.+?):TABLE_DATA_END', re.DOTALL)
 
-# 备份代码：执行后检查未捕获的图表
 BACKUP_CAPTURE_CODE = """
 from sandbox_runtime.charts import capture_current_figures
 capture_current_figures()
 """
 
+# Thread ID of the last execution thread (for forced termination on timeout)
+_exec_thread_id: Optional[int] = None
+
+
+def _force_terminate_thread(thread: threading.Thread) -> bool:
+    """
+    Force-terminate a thread by raising SystemExit in it via ctypes.
+    Returns True if the async exception was successfully set.
+    This is a best-effort mechanism; some C-extension code may not respond.
+    """
+    if not thread.is_alive():
+        return True
+    tid = thread.ident
+    if tid is None:
+        return False
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(tid), ctypes.py_object(SystemExit)
+    )
+    return res == 1
+
 
 def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
     """
     在常驻命名空间中执行代码，捕获 stdout/stderr/charts/tables。
+
+    使用独立线程执行用户代码，stdout/stderr 通过 per-thread io.StringIO
+    捕获（不修改全局 sys.stdout）。超时时通过 ctypes 强制终止线程。
 
     Args:
         code: Python 代码字符串
@@ -122,42 +143,11 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
     import time
     start = time.monotonic()
 
-    # 重新加载数据文件（支持动态添加数据文件）
-    try:
-        from sandbox_runtime.data_loader import load_data_files, get_default_dataframe
-        import os
-        
-        # 调试：检查数据目录
-        data_dir = os.environ.get('DATA_DIR', '/data')
-        print(f"[Kernel] 数据目录: {data_dir}", flush=True)
-        if os.path.exists(data_dir):
-            files = os.listdir(data_dir)
-            print(f"[Kernel] 数据目录文件: {files}", flush=True)
-        else:
-            print(f"[Kernel] 数据目录不存在!", flush=True)
-        
-        # 加载数据文件
-        loaded = load_data_files(globals_dict=_namespace)
-        print(f"[Kernel] 已加载 {len(loaded)} 个数据文件", flush=True)
-        
-        # 更新默认 df
-        _namespace['df'] = get_default_dataframe()
-        
-        # 调试：打印命名空间中的 DataFrame 变量
-        df_vars = [k for k, v in _namespace.items() if hasattr(v, 'shape') and hasattr(v, 'columns')]
-        print(f"[Kernel] DataFrame 变量: {df_vars}", flush=True)
-        
-    except Exception as e:
-        import traceback
-        print(f"[Kernel] 重新加载数据文件失败: {e}", file=sys.stderr, flush=True)
-        print(traceback.format_exc(), file=sys.stderr, flush=True)
+    _reload_data_files()
 
-    # 重定向 stdout / stderr
-    old_stdout, old_stderr = sys.stdout, sys.stderr
     captured_out = io.StringIO()
     captured_err = io.StringIO()
 
-    # 清空上次执行的图表捕获状态
     try:
         from sandbox_runtime.charts import clear_captured_charts
         clear_captured_charts()
@@ -167,11 +157,10 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
     success = True
     error_msg = None
 
-    # 超时控制（使用线程 + Event）
-    timed_out = threading.Event()
-
     def _run():
+        """Execute user code in a dedicated thread with local stdout/stderr."""
         nonlocal success, error_msg
+        old_stdout, old_stderr = sys.stdout, sys.stderr
         sys.stdout = captured_out
         sys.stderr = captured_err
         try:
@@ -183,7 +172,6 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
             except Exception:
                 pass
             exec(code, _namespace)
-            # 备份图表捕获
             exec(BACKUP_CAPTURE_CODE, _namespace)
         except SystemExit:
             pass
@@ -200,9 +188,14 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
     thread.join(timeout=timeout)
 
     if thread.is_alive():
-        # 超时
-        timed_out.set()
         elapsed = time.monotonic() - start
+        _force_terminate_thread(thread)
+        thread.join(timeout=2)
+        if thread.is_alive():
+            print(
+                f"[Kernel] WARNING: thread still alive after forced termination",
+                file=sys.stderr, flush=True,
+            )
         return {
             "success": False,
             "stdout": captured_out.getvalue(),
@@ -216,10 +209,37 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
         }
 
     elapsed = time.monotonic() - start
-    stdout_text = captured_out.getvalue()
-    stderr_text = captured_err.getvalue()
+    return _build_result(captured_out.getvalue(), captured_err.getvalue(),
+                         success, error_msg, elapsed)
 
-    # 提取图表
+
+def _reload_data_files() -> None:
+    """Reload data files into the namespace (supports dynamically added files)."""
+    try:
+        from sandbox_runtime.data_loader import load_data_files, get_default_dataframe
+        data_dir = os.environ.get('DATA_DIR', '/data')
+        if os.path.exists(data_dir):
+            files = os.listdir(data_dir)
+            print(f"[Kernel] 数据目录文件: {files}", flush=True)
+
+        loaded = load_data_files(globals_dict=_namespace)
+        print(f"[Kernel] 已加载 {len(loaded)} 个数据文件", flush=True)
+
+        _namespace['df'] = get_default_dataframe()
+
+    except Exception as e:
+        print(f"[Kernel] 重新加载数据文件失败: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+
+
+def _build_result(
+    stdout_text: str,
+    stderr_text: str,
+    success: bool,
+    error_msg: Optional[str],
+    elapsed: float,
+) -> Dict[str, Any]:
+    """Parse stdout for charts/tables and build the execution result dict."""
     charts = []
     for match in SVG_PATTERN.finditer(stdout_text):
         svg_b64 = match.group(1).strip()
@@ -228,7 +248,6 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
 
     clean_stdout = SVG_PATTERN.sub('[图表已生成]', stdout_text)
 
-    # 提取表格
     tables = []
     for match in TABLE_PATTERN.finditer(stdout_text):
         try:
@@ -239,7 +258,6 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
 
     clean_stdout = TABLE_PATTERN.sub('[表格数据已捕获]', clean_stdout)
 
-    # 构建输出
     output = clean_stdout
     if stderr_text:
         output += f"\n[stderr]:\n{stderr_text}"
@@ -327,21 +345,23 @@ def _send_response(conn: socket.socket, response: dict) -> None:
 
 
 def serve_forever() -> None:
-    """启动 TCP 服务器，每个连接处理一个请求"""
-    # 初始化命名空间
+    """
+    Start TCP server. Each connection is handled serially to guarantee
+    namespace consistency, but with a larger backlog to avoid dropped
+    connections when the queue is briefly busy.
+    """
     _init_namespace()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", KERNEL_PORT))
-    server.listen(5)
+    server.listen(32)
 
     print(f"[Kernel] 监听 0.0.0.0:{KERNEL_PORT}", flush=True)
 
     while True:
         try:
             conn, addr = server.accept()
-            # 每个请求在主线程中串行处理（保证命名空间一致性）
             handle_client(conn, addr)
         except KeyboardInterrupt:
             break

@@ -51,7 +51,7 @@ class CodeValidator:
     AST 代码安全检查器
     
     在代码执行前进行静态分析，阻止危险代码。
-    使用黑名单机制禁止特定模块和函数。
+    使用黑名单机制禁止特定模块、函数和属性访问模式。
     
     用法:
         validator = CodeValidator()
@@ -60,65 +60,36 @@ class CodeValidator:
             print(result.issues)
     """
     
-    # 禁止的模块（黑名单）
     FORBIDDEN_MODULES: Set[str] = {
         # 系统操作
-        'os',
-        'sys',
-        'subprocess',
-        'shutil',
-        'pathlib',  # 仅在需要时禁止
-        
+        'os', 'sys', 'subprocess', 'shutil', 'pathlib',
         # 网络
-        'socket',
-        'http',
-        'urllib',
-        'requests',
-        'httpx',
-        'aiohttp',
-        
+        'socket', 'http', 'urllib', 'requests', 'httpx', 'aiohttp',
         # 进程/线程
-        'multiprocessing',
-        'threading',
-        'concurrent',
-        
+        'multiprocessing', 'threading', 'concurrent',
         # 危险模块
-        'ctypes',
-        'importlib',
-        'builtins',
-        '__builtins__',
-        'code',
-        'codeop',
-        'commands',
-        'pdb',
-        'pickle',
-        'marshal',
-        'shelve',
-        
-        # 文件操作（可选）
-        # 'io',  # 数据分析需要
+        'ctypes', 'importlib', 'builtins', '__builtins__',
+        'code', 'codeop', 'commands', 'pdb', 'pickle', 'marshal', 'shelve',
+        'signal', 'resource', 'pty', 'fcntl', 'termios',
     }
     
-    # 禁止的函数/属性调用
     FORBIDDEN_CALLS: Set[str] = {
-        'exec',
-        'eval',
-        'compile',
-        '__import__',
-        'globals',
-        'locals',
-        'vars',
-        'dir',
-        'getattr',
-        'setattr',
-        'delattr',
-        'hasattr',
-        'breakpoint',
+        'exec', 'eval', 'compile', '__import__',
+        'globals', 'locals', 'vars', 'dir',
+        'getattr', 'setattr', 'delattr', 'hasattr',
+        'breakpoint', 'input', 'help',
+        'memoryview', 'bytearray',
+    }
+
+    FORBIDDEN_DUNDER_ATTRS: Set[str] = {
+        '__import__', '__loader__', '__spec__', '__builtins__',
+        '__subclasses__', '__bases__', '__mro__', '__class__',
+        '__globals__', '__code__', '__func__', '__self__',
+        '__dict__', '__module__', '__qualname__',
     }
     
-    # 允许的"看起来危险但实际安全"的调用
     ALLOWED_EXCEPTIONS: Set[str] = {
-        'open',  # 数据分析需要读取文件
+        'open',
     }
     
     def __init__(
@@ -128,17 +99,9 @@ class CodeValidator:
         allow_open: bool = True,
         strict_mode: bool = False,
     ):
-        """
-        初始化代码验证器
-        
-        Args:
-            forbidden_modules: 自定义禁止模块（合并到默认列表）
-            forbidden_calls: 自定义禁止调用（合并到默认列表）
-            allow_open: 是否允许 open() 函数
-            strict_mode: 严格模式（禁止更多模块）
-        """
         self.forbidden_modules = self.FORBIDDEN_MODULES.copy()
         self.forbidden_calls = self.FORBIDDEN_CALLS.copy()
+        self.forbidden_dunder_attrs = self.FORBIDDEN_DUNDER_ATTRS.copy()
         
         if forbidden_modules:
             self.forbidden_modules.update(forbidden_modules)
@@ -151,24 +114,11 @@ class CodeValidator:
             self.forbidden_calls.add('open')
         
         if strict_mode:
-            # 严格模式额外禁止
             self.forbidden_modules.update({
-                'io',
-                'tempfile',
-                'glob',
-                'fnmatch',
+                'io', 'tempfile', 'glob', 'fnmatch',
             })
     
     def validate(self, code: str) -> ValidationResult:
-        """
-        验证代码安全性
-        
-        Args:
-            code: Python 代码字符串
-            
-        Returns:
-            ValidationResult 对象
-        """
         result = ValidationResult(is_valid=True)
         
         try:
@@ -182,16 +132,12 @@ class CodeValidator:
             ))
             return result
         
-        # 遍历 AST
         for node in ast.walk(tree):
             self._check_node(node, result)
         
         return result
     
     def _check_node(self, node: ast.AST, result: ValidationResult) -> None:
-        """检查单个 AST 节点"""
-        
-        # 检查 import 语句
         if isinstance(node, ast.Import):
             for alias in node.names:
                 module_name = alias.name.split('.')[0]
@@ -203,7 +149,6 @@ class CodeValidator:
                         message=f"禁止导入模块 '{alias.name}'"
                     ))
         
-        # 检查 from ... import 语句
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 module_name = node.module.split('.')[0]
@@ -215,7 +160,6 @@ class CodeValidator:
                         message=f"禁止从 '{node.module}' 导入"
                     ))
         
-        # 检查函数调用
         elif isinstance(node, ast.Call):
             func_name = self._get_call_name(node.func)
             if func_name and func_name in self.forbidden_calls:
@@ -225,9 +169,34 @@ class CodeValidator:
                     line=node.lineno,
                     message=f"禁止调用函数 '{func_name}()'"
                 ))
+
+        elif isinstance(node, ast.Attribute):
+            attr = node.attr
+            if attr in self.forbidden_dunder_attrs:
+                result.add_issue(ValidationIssue(
+                    type="attribute",
+                    name=attr,
+                    line=node.lineno,
+                    message=f"禁止访问属性 '{attr}'"
+                ))
+
+        elif isinstance(node, ast.Subscript):
+            self._check_string_subscript(node, result)
     
+    def _check_string_subscript(self, node: ast.Subscript, result: ValidationResult) -> None:
+        """Block dict/subscript access with forbidden dunder string keys like
+        obj['__import__'] or obj["__builtins__"]."""
+        slic = node.slice
+        if isinstance(slic, ast.Constant) and isinstance(slic.value, str):
+            if slic.value in self.forbidden_dunder_attrs:
+                result.add_issue(ValidationIssue(
+                    type="attribute",
+                    name=slic.value,
+                    line=node.lineno,
+                    message=f"禁止通过下标访问 '{slic.value}'"
+                ))
+
     def _get_call_name(self, node: ast.AST) -> Optional[str]:
-        """获取函数调用的名称"""
         if isinstance(node, ast.Name):
             return node.id
         elif isinstance(node, ast.Attribute):
