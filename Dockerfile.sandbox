@@ -88,6 +88,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # 使用 uv 替代 pip 以获得极速的依赖解析和安装
 RUN uv pip install --no-cache-dir --target=/build/deps -r requirements.txt
 
+# 验证关键包是否安装成功
+RUN PYTHONPATH=/build/deps python -c "import drawsvg; print('✅ drawsvg installed:', drawsvg.__version__)" && \
+    PYTHONPATH=/build/deps python -c "import wqchartpy; print('✅ wqchartpy installed')" && \
+    PYTHONPATH=/build/deps python -c "import pandas; print('✅ pandas installed:', pandas.__version__)" && \
+    PYTHONPATH=/build/deps python -c "import matplotlib; print('✅ matplotlib installed:', matplotlib.__version__)"
+
 # ============================================
 # 最终镜像阶段
 # ============================================
@@ -119,6 +125,9 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/workspace \
     # Kernel Server 端口（常驻执行进程）
     KERNEL_PORT=9999
+
+# 配置国内镜像源加速（可选，国内服务器建议启用）
+# RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources
 
 # 安装系统依赖
 # 合并 RUN 命令以减少镜像层数，优化镜像大小
