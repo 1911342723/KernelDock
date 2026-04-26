@@ -516,6 +516,7 @@ class ContainerPool:
         Raises:
             SandboxCreationError: 容器创建失败
         """
+        container_id: Optional[str] = None
         try:
             # 构建容器配置
             labels = {
@@ -539,21 +540,19 @@ class ContainerPool:
                 detach=True,
                 **config
             )
+            container_id = container_info.container_id
             
             # 启动容器
-            await self._docker_client.start_container(container_info.container_id)
-
-            # 等待容器完全启动（给 kernel_server 时间启动）
-            await asyncio.sleep(2)
+            await self._docker_client.start_container(container_id)
             
             # 验证容器是否仍在运行
-            is_running = await self._docker_client.is_container_running(container_info.container_id)
+            is_running = await self._docker_client.is_container_running(container_id)
             if not is_running:
-                logger.error(f"容器启动后立即退出: {container_info.container_id[:12]}")
+                logger.error(f"容器启动后立即退出: {container_id[:12]}")
                 # 尝试获取容器日志以诊断问题
                 try:
                     logs_result = await self._docker_client.exec_command(
-                        container_info.container_id,
+                        container_id,
                         "echo 'Container exited'",
                         timeout=5
                     )
@@ -564,41 +563,58 @@ class ContainerPool:
                     original_error="Container not running after start"
                 )
 
-            # 验证容器健康状态（尝试执行简单命令）
-            try:
-                health_check = await self._docker_client.exec_command(
-                    container_info.container_id,
-                    "python -c 'print(\"OK\")'",
-                    timeout=10
+            is_healthy = await self._wait_for_container_ready(container_id)
+            if not is_healthy:
+                raise SandboxCreationError(
+                    reason="预热容器 kernel 启动超时",
+                    original_error="Kernel ping readiness timeout"
                 )
-                if health_check.exit_code != 0:
-                    logger.warning(f"容器健康检查失败: {container_info.container_id[:12]}, exit_code={health_check.exit_code}")
-            except Exception as health_err:
-                logger.warning(f"容器健康检查异常: {container_info.container_id[:12]}, {health_err}")
-                # 健康检查失败，但容器在运行，可能是 kernel_server 还在启动中
-                # 再等待一会儿
-                await asyncio.sleep(1)
 
             self._total_created += 1
             
             pooled_container = PooledContainer(
-                container_id=container_info.container_id,
+                container_id=container_id,
                 created_at=datetime.now(),
                 is_healthy=True,
                 last_health_check=datetime.now()
             )
             
-            logger.debug(f"预热容器创建成功: {container_info.container_id[:12]}")
+            logger.debug(f"预热容器创建成功: {container_id[:12]}")
             return pooled_container
             
         except Exception as e:
+            if container_id:
+                await self._remove_container(container_id)
             logger.error(f"创建预热容器失败: {e}")
             raise SandboxCreationError(
                 reason=f"创建预热容器失败: {str(e)}",
                 original_error=str(e)
             )
+
+    async def _wait_for_container_ready(
+        self,
+        container_id: str,
+        timeout_seconds: int = 30,
+        interval_seconds: float = 1.0,
+    ) -> bool:
+        deadline = datetime.now().timestamp() + timeout_seconds
+        last_log_at = 0.0
+        while datetime.now().timestamp() < deadline:
+            if await self._check_container_health(container_id, log_failures=False):
+                return True
+            now = datetime.now().timestamp()
+            if now - last_log_at >= 5:
+                logger.info(f"等待 kernel server 就绪: {container_id[:12]}")
+                last_log_at = now
+            await asyncio.sleep(interval_seconds)
+        logger.warning(f"等待 kernel server 就绪超时: {container_id[:12]}")
+        return False
     
-    async def _check_container_health(self, container_id: str) -> bool:
+    async def _check_container_health(
+        self,
+        container_id: str,
+        log_failures: bool = True,
+    ) -> bool:
         """
         检查容器健康状态
         
@@ -613,21 +629,41 @@ class ContainerPool:
             is_running = await self._docker_client.is_container_running(container_id)
             
             if not is_running:
-                logger.debug(f"容器 {container_id[:12]} 未运行")
+                if log_failures:
+                    logger.debug(f"容器 {container_id[:12]} 未运行")
                 return False
             
-            # 可以添加更多健康检查逻辑，如执行简单命令
-            # result = await self._docker_client.exec_command(
-            #     container_id,
-            #     "echo health_check",
-            #     timeout=5
-            # )
-            # return result.exit_code == 0
+            ping_cmd = (
+                'python -c "'
+                "import socket,json;"
+                "s=socket.socket();"
+                "s.settimeout(3);"
+                "s.connect(('127.0.0.1',9999));"
+                "p=json.dumps({'action':'ping'}).encode();"
+                "s.sendall(len(p).to_bytes(4,'big')+p);"
+                "data=s.recv(4096);"
+                "s.close();"
+                "raise SystemExit(0 if b'\\\"ok\\\"' in data else 1)"
+                '"'
+            )
+            result = await self._docker_client.exec_command(
+                container_id,
+                ping_cmd,
+                timeout=5,
+            )
+            if result.exit_code != 0:
+                if log_failures:
+                    logger.warning(
+                        f"Kernel 健康检查失败: {container_id[:12]}, "
+                        f"exit={result.exit_code}, stderr={result.stderr[:200]}"
+                    )
+                return False
             
             return True
             
         except Exception as e:
-            logger.warning(f"健康检查失败: {container_id[:12]}, 错误: {e}")
+            if log_failures:
+                logger.warning(f"健康检查失败: {container_id[:12]}, 错误: {e}")
             return False
     
     async def _remove_container(self, container_id: str) -> None:

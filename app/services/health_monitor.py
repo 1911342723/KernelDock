@@ -58,6 +58,7 @@ class ServiceHealth:
     memory_usage_percent: float        # 系统内存使用率
     uptime_seconds: int                # 服务运行时间
     last_check: datetime               # 最后检查时间
+    details: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -75,6 +76,7 @@ class ServiceHealth:
             "memory_usage_percent": round(self.memory_usage_percent, 2),
             "uptime_seconds": self.uptime_seconds,
             "last_check": self.last_check.isoformat(),
+            "details": self.details,
         }
 
 
@@ -338,19 +340,53 @@ class HealthMonitor:
         # 获取容器池状态
         pool_available = 0
         pool_total = 0
+        pool_running = False
+        pool_size = 0
         if self._container_pool:
             pool_available = self._container_pool.available_count
             pool_total = self._container_pool.total_count
+            pool_running = self._container_pool.is_running
+            pool_size = self._container_pool.pool_size
         
         # 获取系统资源使用
         cpu_usage = psutil.cpu_percent(interval=0.1)
         memory = psutil.virtual_memory()
         memory_usage = memory.percent
         
+        docker_ok = self._check_docker_connection()
+        
+        details = {
+            "docker": {
+                "configured": self._docker_client is not None,
+                "ok": docker_ok,
+            },
+            "container_pool": {
+                "configured": self._container_pool is not None,
+                "running": pool_running,
+                "pool_size": pool_size,
+                "available": pool_available,
+                "total": pool_total,
+            },
+            "sandbox_manager": {
+                "configured": self._sandbox_manager is not None,
+            },
+            "monitor": {
+                "running": self._running,
+                "last_metrics_update": (
+                    self._last_metrics_update.isoformat()
+                    if self._last_metrics_update else None
+                ),
+            },
+            "local_fallback_allowed": settings.allow_local_fallback,
+        }
+        
         # 确定健康状态
         status = self._determine_health_status(
-            active_sandboxes=active_sandboxes,
             pool_available=pool_available,
+            pool_total=pool_total,
+            pool_size=pool_size,
+            pool_running=pool_running,
+            docker_ok=docker_ok,
             cpu_usage=cpu_usage,
             memory_usage=memory_usage
         )
@@ -363,7 +399,8 @@ class HealthMonitor:
             cpu_usage_percent=cpu_usage,
             memory_usage_percent=memory_usage,
             uptime_seconds=self.uptime_seconds,
-            last_check=now
+            last_check=now,
+            details=details
         )
         
         # 缓存健康状态
@@ -373,8 +410,11 @@ class HealthMonitor:
     
     def _determine_health_status(
         self,
-        active_sandboxes: int,
         pool_available: int,
+        pool_total: int,
+        pool_size: int,
+        pool_running: bool,
+        docker_ok: bool,
         cpu_usage: float,
         memory_usage: float
     ) -> str:
@@ -392,13 +432,8 @@ class HealthMonitor:
         Returns:
             健康状态字符串（healthy/degraded/unhealthy）
         """
-        # 检查 Docker 连接
-        if self._docker_client:
-            try:
-                if not self._docker_client.ping():
-                    return "unhealthy"
-            except Exception:
-                return "unhealthy"
+        if not docker_ok:
+            return "unhealthy"
         
         # 检查资源使用是否过高
         if cpu_usage > 95 or memory_usage > 95:
@@ -409,12 +444,23 @@ class HealthMonitor:
             return "degraded"
         
         # 检查容器池是否耗尽
-        if self._container_pool and pool_available == 0:
-            pool_size = self._container_pool.pool_size
-            if pool_size > 0:  # 配置了容器池但没有可用容器
+        if self._container_pool and pool_size > 0:
+            if not pool_running:
+                return "unhealthy"
+            if pool_total == 0:
+                return "unhealthy"
+            if pool_available == 0:
                 return "degraded"
         
         return "healthy"
+
+    def _check_docker_connection(self) -> bool:
+        if not self._docker_client:
+            return False
+        try:
+            return self._docker_client.ping()
+        except Exception:
+            return False
 
     async def get_sandbox_metrics(self, sandbox_id: str) -> Optional[SandboxMetrics]:
         """
@@ -540,6 +586,22 @@ class HealthMonitor:
         lines.append(f"sandbox_service_uptime_seconds {self.uptime_seconds}")
         lines.append("")
         
+        docker_up = 1 if self._check_docker_connection() else 0
+        lines.append("# HELP sandbox_docker_up Docker daemon 是否可用")
+        lines.append("# TYPE sandbox_docker_up gauge")
+        lines.append(f"sandbox_docker_up {docker_up}")
+        lines.append("")
+        
+        status_value = 0
+        if self._cached_health:
+            status_value = {"healthy": 2, "degraded": 1, "unhealthy": 0}.get(
+                self._cached_health.status, 0
+            )
+        lines.append("# HELP sandbox_health_status 服务健康状态 healthy=2 degraded=1 unhealthy=0")
+        lines.append("# TYPE sandbox_health_status gauge")
+        lines.append(f"sandbox_health_status {status_value}")
+        lines.append("")
+        
         # 活跃沙箱数量
         active_sandboxes = 0
         if self._sandbox_manager:
@@ -579,6 +641,11 @@ class HealthMonitor:
             lines.append("# HELP sandbox_pool_size 配置的容器池大小")
             lines.append("# TYPE sandbox_pool_size gauge")
             lines.append(f"sandbox_pool_size {pool_size}")
+            lines.append("")
+            
+            lines.append("# HELP sandbox_pool_running 容器池后台任务是否运行")
+            lines.append("# TYPE sandbox_pool_running gauge")
+            lines.append(f"sandbox_pool_running {1 if self._container_pool.is_running else 0}")
             lines.append("")
             
             # 容器池统计

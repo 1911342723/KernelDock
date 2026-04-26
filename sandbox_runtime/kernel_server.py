@@ -191,11 +191,20 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
         elapsed = time.monotonic() - start
         _force_terminate_thread(thread)
         thread.join(timeout=2)
+        kernel_unhealthy = True
         if thread.is_alive():
             print(
                 f"[Kernel] WARNING: thread still alive after forced termination",
                 file=sys.stderr, flush=True,
             )
+        try:
+            reset_namespace()
+        except Exception as e:
+            print(f"[Kernel] WARNING: reset after timeout failed: {e}", file=sys.stderr, flush=True)
+        try:
+            threading.Timer(1.0, lambda: os._exit(124)).start()
+        except Exception:
+            pass
         return {
             "success": False,
             "stdout": captured_out.getvalue(),
@@ -206,6 +215,7 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
             "images": [],
             "error": f"执行超时（{timeout}秒）",
             "execution_time_ms": int(elapsed * 1000),
+            "kernel_unhealthy": kernel_unhealthy,
         }
 
     elapsed = time.monotonic() - start
@@ -216,11 +226,15 @@ def execute_code(code: str, timeout: int = 300) -> Dict[str, Any]:
 def _reload_data_files() -> None:
     """Reload data files into the namespace (supports dynamically added files)."""
     try:
-        from sandbox_runtime.data_loader import load_data_files, get_default_dataframe
+        from sandbox_runtime.data_loader import load_data_files, get_default_dataframe, get_loaded_tables, generate_variable_name
         data_dir = os.environ.get('DATA_DIR', '/data')
         if os.path.exists(data_dir):
             files = os.listdir(data_dir)
             print(f"[Kernel] 数据目录文件: {files}", flush=True)
+
+        for old_filename in get_loaded_tables().keys():
+            old_var_name = generate_variable_name(old_filename)
+            _namespace.pop(old_var_name, None)
 
         loaded = load_data_files(globals_dict=_namespace)
         print(f"[Kernel] 已加载 {len(loaded)} 个数据文件", flush=True)

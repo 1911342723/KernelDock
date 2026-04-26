@@ -19,6 +19,7 @@ _data_dir: str = os.environ.get('DATA_DIR', '/data')
 _output_dir: str = os.environ.get('OUTPUT_DIR', '/output')
 _initialized: bool = False
 _selected_font: Optional[str] = None
+_fonts_registered: bool = False
 
 
 def get_data_dir() -> str:
@@ -95,21 +96,59 @@ def _setup_encoding() -> None:
         pass  # 在某些环境中可能失败，忽略
 
 
-def _setup_matplotlib() -> None:
-    """配置 Matplotlib"""
+def ensure_chinese_font() -> Optional[str]:
+    """Ensure matplotlib uses an available CJK-capable font."""
     global _selected_font
     try:
-        import matplotlib
-        matplotlib.use('Agg')
-        
         import matplotlib.pyplot as plt
+
+        if not _selected_font:
+            _selected_font = _select_chinese_font()
+
+        font_chain = [
+            f for f in [
+                _selected_font,
+                'Noto Sans CJK SC',
+                'Noto Sans CJK JP',
+                'WenQuanYi Micro Hei',
+                'WenQuanYi Zen Hei',
+                'SimHei',
+                'DejaVu Sans',
+                'DejaVu Sans Display',
+                'STIXGeneral',
+                'Noto Sans Math',
+                'Noto Sans Symbols',
+                'Noto Sans Symbols2',
+                'Symbola',
+                'Arial',
+            ]
+            if f
+        ]
+        seen = set()
+        font_chain = [f for f in font_chain if not (f in seen or seen.add(f))]
+        plt.rcParams['font.sans-serif'] = font_chain
+        plt.rcParams['font.family'] = 'sans-serif'
+        plt.rcParams['axes.unicode_minus'] = False
+        plt.rcParams['mathtext.fontset'] = 'dejavusans'
+        plt.rcParams['svg.fonttype'] = 'path'
+        plt.rcParams['pdf.fonttype'] = 42
+        plt.rcParams['ps.fonttype'] = 42
+        os.environ['MPL_FONT_SANS_SERIF'] = ','.join(font_chain)
+        return _selected_font
+    except Exception:
+        return _selected_font
+
+
+def _register_font_dirs() -> None:
+    global _fonts_registered
+    if _fonts_registered:
+        return
+    try:
         import matplotlib.font_manager as fm
-        
-        # 重建字体缓存
+
         fm._load_fontmanager(try_read_cache=False)
-        
-        # 手动添加字体目录（Debian/Ubuntu 字体路径）
         font_dirs = [
+            '/usr/share/fonts/truetype/simhei',
             '/usr/share/fonts/truetype/wqy',
             '/usr/share/fonts/opentype/noto',
             '/usr/share/fonts/truetype/noto',
@@ -128,34 +167,53 @@ def _setup_matplotlib() -> None:
                                 fm.fontManager.addfont(font_path)
                             except Exception:
                                 pass
-        
-        # 查找可用的中文字体（科研规范优先）
-        available_fonts = set(f.name for f in fm.fontManager.ttflist)
-        print(f"[Font] Available CJK fonts: {[f for f in available_fonts if 'CJK' in f or 'Hei' in f or 'Song' in f or 'Noto' in f][:10]}")
-        
+        _fonts_registered = True
+    except Exception:
+        pass
+
+
+def _select_chinese_font() -> str:
+    global _selected_font
+    _register_font_dirs()
+    try:
+        import matplotlib.font_manager as fm
+
+        available_fonts = {f.name for f in fm.fontManager.ttflist}
         chinese_fonts = [
-            'Noto Sans CJK SC',     # Debian 安装的 Noto CJK
+            'Noto Sans CJK SC',
             'Noto Sans CJK JP',
             'Noto Sans CJK TC',
-            'WenQuanYi Micro Hei',  # 文泉驿微米黑
+            'WenQuanYi Micro Hei',
             'WenQuanYi Zen Hei',
-            'SimHei',               # 科研图表标准字体
-            'Microsoft YaHei',
+            'SimHei',
             'Noto Serif CJK SC',
+            'AR PL UMing CN',
+            'AR PL UKai CN',
+            'Microsoft YaHei',
             'PingFang SC',
+            'DejaVu Sans',
         ]
-        selected_font = next(
-            (f for f in chinese_fonts if f in available_fonts),
-            'DejaVu Sans'
+        _selected_font = next(
+            (font for font in chinese_fonts if font in available_fonts),
+            'DejaVu Sans',
         )
-        _selected_font = selected_font
-        os.environ['MPL_FONT_SANS_SERIF'] = ','.join([selected_font, 'DejaVu Sans', 'Arial'])
+        return _selected_font
+    except Exception:
+        _selected_font = 'DejaVu Sans'
+        return _selected_font
+
+
+def _setup_matplotlib() -> None:
+    """配置 Matplotlib"""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        
+        import matplotlib.pyplot as plt
+        selected_font = ensure_chinese_font()
         print(f"[Font] Selected: {selected_font}")
         
         # 应用字体配置
-        plt.rcParams['font.sans-serif'] = [selected_font, 'DejaVu Sans', 'Arial']
-        plt.rcParams['font.family'] = 'sans-serif'
-        plt.rcParams['axes.unicode_minus'] = False
         plt.rcParams['figure.dpi'] = 150
         plt.rcParams['savefig.dpi'] = 300
         plt.rcParams['figure.facecolor'] = 'white'

@@ -103,7 +103,10 @@ async def lifespan(app: FastAPI):
         
         logger.info("沙箱管理器初始化完成")
     except Exception as e:
-        logger.warning(f"沙箱管理器初始化失败，将使用本地执行模式: {e}")
+        if settings.allow_local_fallback:
+            logger.warning(f"沙箱管理器初始化失败，将使用本地执行模式: {e}")
+        else:
+            logger.error(f"沙箱管理器初始化失败，本地回退已禁用: {e}")
         _sandbox_manager = None
     
     logger.info("Code Executor Service 启动完成")
@@ -315,6 +318,8 @@ async def health_check():
                 "cpu_usage_percent": round(health.cpu_usage_percent, 2),
                 "memory_usage_percent": round(health.memory_usage_percent, 2),
                 "uptime_seconds": health.uptime_seconds,
+                "last_check": health.last_check.isoformat(),
+                "details": health.details,
             }
         except Exception as e:
             logger.warning(f"获取健康状态失败: {e}")
@@ -583,7 +588,33 @@ async def _do_execute_code(session_id: str, session, request: ExecuteCodeRequest
                 )
                 return result, "sandbox_kernel", sandbox_info
             except Exception as e:
+                if not settings.allow_local_fallback:
+                    logger.error(f"沙箱执行失败，本地回退已禁用: {e}")
+                    return {
+                        "success": False,
+                        "stdout": "",
+                        "stderr": str(e),
+                        "output": f"[SandboxError]: {e}",
+                        "charts": [],
+                        "tables": [],
+                        "images": [],
+                        "error": f"Sandbox execution failed: {e}",
+                        "execution_time_ms": 0,
+                    }, "sandbox_kernel", sandbox_info
                 logger.error(f"沙箱执行失败，回退到本地执行: {e}")
+
+    if not settings.allow_local_fallback:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Sandbox manager is unavailable and local fallback is disabled",
+            "output": "[SandboxError]: 沙箱服务不可用，且本地执行回退已禁用",
+            "charts": [],
+            "tables": [],
+            "images": [],
+            "error": "Sandbox manager unavailable",
+            "execution_time_ms": 0,
+        }, "sandbox_unavailable", None
 
     result = await session.execute_code(request.code, request.timeout)
     return result, "local_subprocess", None
@@ -929,6 +960,19 @@ async def execute_stateless(request: StatelessExecuteRequest):
                 timeout=request.timeout,
             )
 
+        if not settings.allow_local_fallback:
+            exec_path = "sandbox_unavailable"
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": "Sandbox manager is unavailable and local fallback is disabled",
+                "output": "[SandboxError]: 沙箱服务不可用，且本地执行回退已禁用",
+                "charts": [],
+                "tables": [],
+                "images": [],
+                "error": "Sandbox manager unavailable",
+                "execution_time_ms": 0,
+            }
         logger.info("沙箱管理器不可用，使用本地执行模式")
         exec_path = "local_subprocess"
         import uuid as _uuid

@@ -22,6 +22,7 @@ from datetime import datetime
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
+from .config import settings
 from .executor import session_manager, DEFAULT_TIMEOUT
 from .services.sandbox_manager import SandboxManager
 from .services.execution_queue import ExecutionQueue
@@ -269,9 +270,32 @@ async def _do_execute(session_id, session, code, timeout, websocket, connection_
                 return result
             except Exception as e:
                 logger.error(f"Sandbox execution failed: {e}")
-                # 回退到本地执行
+                if not settings.allow_local_fallback:
+                    return {
+                        "success": False,
+                        "stdout": "",
+                        "stderr": str(e),
+                        "output": f"[SandboxError]: {e}",
+                        "charts": [],
+                        "tables": [],
+                        "images": [],
+                        "error": f"Sandbox execution failed: {e}",
+                        "execution_time_ms": 0,
+                    }
 
     # 本地执行
+    if not settings.allow_local_fallback:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Sandbox manager is unavailable and local fallback is disabled",
+            "output": "[SandboxError]: 沙箱服务不可用，且本地执行回退已禁用",
+            "charts": [],
+            "tables": [],
+            "images": [],
+            "error": "Sandbox manager unavailable",
+            "execution_time_ms": 0,
+        }
     logger.info(f"[EXECUTE] 使用本地执行模式...")
 
     # 定义输出回调

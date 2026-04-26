@@ -937,9 +937,14 @@ class StatelessSession:
             import pandas as pd
             data = json.loads(data_json)
             df = pd.DataFrame(data)
+            for existing in os.listdir(self.data_dir):
+                existing_path = os.path.join(self.data_dir, existing)
+                if os.path.isfile(existing_path) and existing.endswith(('.csv', '.xlsx', '.xls')):
+                    os.remove(existing_path)
+            self.data_files.clear()
             file_path = self.get_data_file_path(filename)
             df.to_csv(file_path, index=False, encoding='utf-8-sig')
-            self.data_files.append(filename)
+            self.data_files = [filename]
             return {
                 "success": True,
                 "file_path": file_path,
@@ -962,10 +967,15 @@ class StatelessSession:
             加载结果字典
         """
         try:
+            for existing in os.listdir(self.data_dir):
+                existing_path = os.path.join(self.data_dir, existing)
+                if os.path.isfile(existing_path) and existing.endswith(('.csv', '.xlsx', '.xls')):
+                    os.remove(existing_path)
+            self.data_files.clear()
             file_path = os.path.join(self.data_dir, filename)
             with open(file_path, 'wb') as f:
                 f.write(file_content)
-            self.data_files.append(filename)
+            self.data_files = [filename]
             
             import pandas as pd
             if filename.endswith('.csv'):

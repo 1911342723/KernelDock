@@ -406,6 +406,10 @@ class SandboxSettings(BaseSettings):
         le=1.0,
         description="Sentry 追踪采样率"
     )
+    allow_local_fallback: bool = Field(
+        default=False,
+        description="是否允许 Docker 沙箱不可用时回退到本地 subprocess 执行"
+    )
     
     @field_validator("log_level")
     @classmethod

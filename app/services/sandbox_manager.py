@@ -407,7 +407,7 @@ class SandboxManager:
             timeout = timeout_seconds or settings.timeout.session_idle_timeout
             
             # 创建工作空间目录
-            data_dir, output_dir = self._create_workspace_dirs(sandbox_id)
+            data_dir, output_dir = self._create_workspace_dirs(session_id)
             
             # 创建新容器（不使用预热容器池，因为有状态会话需要自定义配置）
             container_id = await self._create_container(
@@ -707,30 +707,19 @@ class SandboxManager:
                 timeout=timeout,
             )
 
-            # 4. 清理container workspace and reset kernel namespace
-            await self._cleanup_container_workspace(container_id)
-            await self._reset_kernel_namespace(container_id)
-
-            # 5. 归还容器
-            await self._container_pool.release(container_id)
+            cleanup_ok = (
+                False
+                if result.get("kernel_unhealthy")
+                else await self._cleanup_and_reset_for_reuse(container_id)
+            )
+            await self._release_or_destroy_stateless_container(container_id, cleanup_ok)
 
             return result
 
         except Exception as e:
             logger.error(f"无状态执行失败: {e}, 容器: {container_id[:12]}")
-            # 执行失败，尝试清理后归还；如果清理也失败则销毁
-            try:
-                await self._cleanup_container_workspace(container_id)
-                await self._container_pool.release(container_id)
-            except Exception:
-                logger.warning(f"容器 {container_id[:12]} 清理失败，销毁")
-                try:
-                    await self._docker_client.stop_container(container_id, timeout=5)
-                    await self._docker_client.remove_container(container_id, force=True)
-                except Exception:
-                    pass
-                # 触发补充
-                asyncio.create_task(self._container_pool.replenish())
+            cleanup_ok = await self._cleanup_and_reset_for_reuse(container_id)
+            await self._release_or_destroy_stateless_container(container_id, cleanup_ok)
             raise
 
     async def _execute_stateless_with_temp_container(
@@ -786,6 +775,28 @@ class SandboxManager:
             except Exception as e:
                 logger.warning(f"清理临时容器失败: {e}")
 
+    async def _cleanup_and_reset_for_reuse(self, container_id: str) -> bool:
+        try:
+            await self._cleanup_container_workspace(container_id)
+            return await self._reset_kernel_namespace(container_id)
+        except Exception as e:
+            logger.warning(f"容器 {container_id[:12]} 清理或重置失败: {e}")
+            return False
+
+    async def _release_or_destroy_stateless_container(
+        self, container_id: str, reusable: bool
+    ) -> None:
+        if reusable:
+            await self._container_pool.release(container_id)
+            return
+        logger.warning(f"容器 {container_id[:12]} 不可安全复用，销毁并补池")
+        try:
+            await self._docker_client.stop_container(container_id, timeout=5)
+            await self._docker_client.remove_container(container_id, force=True)
+        except Exception as e:
+            logger.warning(f"销毁不可复用容器失败: {container_id[:12]}, {e}")
+        asyncio.create_task(self._container_pool.replenish())
+
     async def _inject_data_files(
         self, container_id: str, data_files: Dict[str, str]
     ) -> None:
@@ -806,6 +817,12 @@ class SandboxManager:
         logger.info(f"[数据注入] 开始注入 {len(data_files)} 个文件到容器 {container_id[:12]}")
         for fname in data_files.keys():
             logger.info(f"[数据注入] 文件: {fname}, base64长度: {len(data_files[fname])}")
+
+        await self._docker_client.exec_command(
+            container_id,
+            "find /data -mindepth 1 -maxdepth 1 -type f -delete",
+            timeout=10,
+        )
 
         # --- 优先方案：将所有文件打包为 tar 一次性传输 ---
         try:
@@ -932,13 +949,13 @@ class SandboxManager:
             logger.warning(f"清理容器工作空间失败: {container_id[:12]}, {e}")
             raise InternalError(message=f"清理容器工作空间失败: {str(e)}", original_error=e)
 
-    async def _reset_kernel_namespace(self, container_id: str) -> None:
+    async def _reset_kernel_namespace(self, container_id: str) -> bool:
         """
         Reset the Kernel Server namespace inside the container to prevent
         cross-user variable leakage in stateless execution mode.
 
-        Sends a reset request via kernel_relay. Failures are logged but
-        do not prevent container reuse.
+        Sends a reset request via kernel_relay. Returns False on failure so
+        callers can avoid returning a contaminated container to the pool.
         """
         try:
             reset_cmd = (
@@ -957,13 +974,16 @@ class SandboxManager:
             )
             if result.exit_code == 0:
                 logger.debug(f"Kernel namespace reset: {container_id[:12]}")
+                return True
             else:
                 logger.warning(
                     f"Kernel namespace reset failed: {container_id[:12]}, "
                     f"exit={result.exit_code}"
                 )
+                return False
         except Exception as e:
             logger.warning(f"Kernel namespace reset error: {container_id[:12]}, {e}")
+            return False
 
     async def list_sandboxes(
         self,

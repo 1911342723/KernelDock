@@ -18,6 +18,87 @@ _captured_figure_ids: Set[int] = set()  # 已捕获的 figure id，防止重复
 _hooks_registered: bool = False
 
 
+def _ensure_font_before_save() -> None:
+    try:
+        from sandbox_runtime.setup import ensure_chinese_font
+        ensure_chinese_font()
+    except Exception:
+        pass
+
+
+_SUBSCRIPT_MAP = {
+    '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
+    '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
+    '₊': '+', '₋': '-', '₌': '=', '₍': '(', '₎': ')',
+}
+
+_SUPERSCRIPT_MAP = {
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+    '⁺': '+', '⁻': '-', '⁼': '=', '⁽': '(', '⁾': ')',
+}
+
+
+def _escape_mathtext(value: str) -> str:
+    return value.replace('\\', r'\\').replace(' ', r'\ ')
+
+
+def _normalize_symbol_text(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    normalized = value.replace('−', '-')
+    symbol_chars = tuple(_SUBSCRIPT_MAP) + tuple(_SUPERSCRIPT_MAP)
+    if not any(ch in normalized for ch in symbol_chars):
+        return normalized
+    parts = []
+    buffer = []
+    mode = None
+
+    def flush() -> None:
+        nonlocal buffer, mode
+        if not buffer:
+            return
+        content = ''.join(buffer)
+        if mode == 'sub':
+            parts.append('$_{' + _escape_mathtext(content) + '}$')
+        elif mode == 'sup':
+            parts.append('$^{' + _escape_mathtext(content) + '}$')
+        else:
+            parts.append(content)
+        buffer = []
+        mode = None
+
+    for ch in normalized:
+        if ch in _SUBSCRIPT_MAP:
+            if mode != 'sub':
+                flush()
+                mode = 'sub'
+            buffer.append(_SUBSCRIPT_MAP[ch])
+        elif ch in _SUPERSCRIPT_MAP:
+            if mode != 'sup':
+                flush()
+                mode = 'sup'
+            buffer.append(_SUPERSCRIPT_MAP[ch])
+        else:
+            if mode is not None:
+                flush()
+            parts.append(ch)
+    flush()
+    return ''.join(parts)
+
+
+def _normalize_figure_text(fig) -> None:
+    try:
+        import matplotlib.text as mtext
+        for text in fig.findobj(match=mtext.Text):
+            current = text.get_text()
+            normalized = _normalize_symbol_text(current)
+            if normalized != current:
+                text.set_text(normalized)
+    except Exception:
+        pass
+
+
 def get_captured_charts() -> List[Dict[str, Any]]:
     """获取已捕获的图表列表"""
     return _captured_charts.copy()
@@ -62,6 +143,8 @@ def save_figure(
     # 仅在显式指定 output_dir 时写磁盘
     if output_dir:
         file_path = os.path.join(output_dir, f"{name}.{format}")
+        _ensure_font_before_save()
+        _normalize_figure_text(fig)
         fig.savefig(file_path, format=format, bbox_inches='tight', facecolor='white')
     
     # 始终生成 base64 通过 stdout 传输
@@ -97,6 +180,8 @@ def capture_current_figures() -> List[Dict[str, Any]]:
             
             # 仅生成内存中的 base64，不写磁盘
             buf = io.BytesIO()
+            _ensure_font_before_save()
+            _normalize_figure_text(fig)
             fig.savefig(buf, format='svg', bbox_inches='tight', facecolor='white')
             buf.seek(0)
             svg_b64 = base64.b64encode(buf.read()).decode('utf-8')
@@ -130,6 +215,8 @@ def _capture_figure_to_base64(fig, file_path: Optional[str] = None) -> None:
     _captured_figure_ids.add(fig_num)
     
     buf = io.BytesIO()
+    _ensure_font_before_save()
+    _normalize_figure_text(fig)
     fig.savefig(buf, format='svg', bbox_inches='tight', facecolor='white')
     buf.seek(0)
     svg_b64 = base64.b64encode(buf.read()).decode('utf-8')

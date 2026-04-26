@@ -113,11 +113,13 @@ def load_data_files(
             print(f"[Info] 数据目录不存在: {data_dir}")
             return {}
         
+        _loaded_tables = {}
+        
         # 扫描数据文件
-        data_files = [
+        data_files = sorted([
             f for f in os.listdir(data_dir)
             if f.endswith(('.csv', '.xlsx', '.xls'))
-        ]
+        ])
         
         if not data_files:
             print("[Info] 未找到数据文件")
