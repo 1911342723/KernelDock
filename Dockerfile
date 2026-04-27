@@ -4,6 +4,10 @@
 
 FROM python:3.11-slim AS builder
 
+ARG USE_CHINA_MIRROR=1
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
 # 设置构建阶段环境变量
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -16,12 +20,20 @@ WORKDIR /build
 COPY requirements.txt .
 
 # 安装 Python 依赖到临时目录
-RUN pip install --no-cache-dir --target=/build/deps -r requirements.txt
+RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
+      pip install --no-cache-dir -i "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST" --target=/build/deps -r requirements.txt; \
+    else \
+      pip install --no-cache-dir --target=/build/deps -r requirements.txt; \
+    fi
 
 # ============================================
 # 最终镜像阶段
 # ============================================
 FROM python:3.11-slim
+
+ARG USE_CHINA_MIRROR=1
+ARG INSTALL_FULL_CJK_FONTS=0
+ARG INSTALL_SIMHEI_FONT=0
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
@@ -35,27 +47,32 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/deps:$PYTHONPATH
 
 # 安装系统依赖（合并 RUN 命令以减少镜像层数）
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
+      sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
+        /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
     # 基础工具（健康检查需要）
     curl \
     wget \
-    # 中文字体支持（科研规范：宋体、黑体、楷体）
-    fonts-noto-cjk \
-    fonts-noto-cjk-extra \
+    # 轻量中文字体支持
     fonts-wqy-microhei \
-    fonts-wqy-zenhei \
     fontconfig \
     # matplotlib 依赖
     libfreetype6 \
     libpng16-16 \
+    && if [ "$INSTALL_FULL_CJK_FONTS" = "1" ]; then \
+      apt-get install -y --no-install-recommends fonts-noto-cjk fonts-noto-cjk-extra fonts-wqy-zenhei; \
+    fi \
     # 清理缓存以减小镜像大小
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
     && rm -rf /var/cache/apt/archives/* \
-    # 下载 SimHei 字体（科研图表标准字体）
-    && mkdir -p /usr/share/fonts/truetype/simhei \
-    && wget -q -O /usr/share/fonts/truetype/simhei/SimHei.ttf \
-       "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf" \
+    && if [ "$INSTALL_SIMHEI_FONT" = "1" ]; then \
+      mkdir -p /usr/share/fonts/truetype/simhei \
+      && wget -q -O /usr/share/fonts/truetype/simhei/SimHei.ttf \
+         "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"; \
+    fi \
     # 刷新字体缓存
     && fc-cache -fv
 
