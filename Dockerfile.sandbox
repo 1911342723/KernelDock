@@ -30,9 +30,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Debian 12+ 使用 deb822 格式 /etc/apt/sources.list.d/debian.sources；
 # 旧版镜像 fallback 到 /etc/apt/sources.list
 RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
-      sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
-        /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
-    fi
+            sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
+                /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
+        fi
 
 # pip / uv 国内索引（清华 TUNA，速度最稳）
 ENV PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple} \
@@ -147,10 +147,10 @@ ARG USE_CHINA_MIRROR=1
 
 # 配置国内镜像源加速 apt（Debian 12+ 默认使用 deb822 格式）
 # 海外部署请传 --build-arg USE_CHINA_MIRROR=0 关闭
-RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
-      sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
-        /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
-    fi
+        RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
+            sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
+                /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
+        fi
 
 # 安装系统依赖
 # 合并 RUN 命令以减少镜像层数，优化镜像大小
@@ -194,16 +194,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/cache/apt/archives/* \
     && rm -rf /tmp/* /var/tmp/* \
-    # 下载 SimHei 字体（科研图表标准字体）
-    # 国内环境走 gitee 镜像；失败时 fallback 到 github raw，仍失败则跳过（SimHei 非必需）
-    && mkdir -p /usr/share/fonts/truetype/simhei \
-    && ( \
-         wget -q --tries=2 --timeout=20 -O /usr/share/fonts/truetype/simhei/SimHei.ttf \
-           "https://gitee.com/mirrors_StellarCN/scp_zh/raw/master/fonts/SimHei.ttf" \
-         || wget -q --tries=2 --timeout=20 -O /usr/share/fonts/truetype/simhei/SimHei.ttf \
-           "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf" \
-         || (echo '⚠️ SimHei 下载失败，跳过（回退 fonts-wqy-microhei 作为中文字体）' && rm -f /usr/share/fonts/truetype/simhei/SimHei.ttf) \
-       ) \
+        # 下载 SimHei 字体（优先且仅从 Gitee 获取）
+        # 如果 Gitee 下载失败，不回退到 GitHub，构建继续但会记录警告
+        && mkdir -p /usr/share/fonts/truetype/simhei \
+        && ( \
+                 wget -q --tries=3 --timeout=20 -O /usr/share/fonts/truetype/simhei/SimHei.ttf \
+                     "https://gitee.com/mirrors_StellarCN/scp_zh/raw/master/fonts/SimHei.ttf" \
+                 || (echo '⚠️ SimHei 从 Gitee 下载失败，继续构建但未安装 SimHei' && rm -f /usr/share/fonts/truetype/simhei/SimHei.ttf) \
+             ) \
     # 刷新字体缓存
     && fc-cache -fv
 
