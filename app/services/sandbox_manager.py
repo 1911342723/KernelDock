@@ -856,10 +856,15 @@ class SandboxManager:
             await _log_data_dir_listing()
             return
         except Exception as e:
-            logger.debug(f"[pre_load_parquet] put_archive 失败，回退 echo+base64: {e}")
+            logger.warning(
+                f"[pre_load_parquet] put_archive 失败，回退 echo+base64: "
+                f"container={short_cid} error={e!r}"
+            )
 
         # 回退 echo+base64
-        RAW_CHUNK_SIZE = 24576
+        # Docker exec 通过 shell 传超长 echo 命令时在部分 Docker Desktop/
+        # named-pipe 场景会偶发失败；把 chunk 控制在更保守的长度。
+        RAW_CHUNK_SIZE = 8192
         for ref, raw in decoded.items():
             target = f"/data/{ref}.parquet"
             for i in range(0, len(raw), RAW_CHUNK_SIZE):
@@ -875,7 +880,8 @@ class SandboxManager:
                     raise InternalError(
                         message=(
                             f"[pre_load_parquet] chunk write failed ref={ref} "
-                            f"chunk={i // RAW_CHUNK_SIZE} stderr={result.stderr}"
+                            f"chunk={i // RAW_CHUNK_SIZE} exit={result.exit_code} "
+                            f"stdout={result.stdout!r} stderr={result.stderr!r}"
                         )
                     )
         await _log_data_dir_listing()
