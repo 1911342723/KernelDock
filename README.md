@@ -15,12 +15,23 @@
 ### Docker Compose（推荐）
 
 ```bash
-# 1. 构建沙箱镜像
-docker build -t code-executor-sandbox:latest -f Dockerfile.sandbox .
+# 1. 构建 base + app 双层镜像
+./build.sh all
+
+# 或分开构建
+./build.sh base
+./build.sh app
 
 # 2. 启动服务
 docker compose up -d --build
 ```
+
+双层镜像约定：
+
+- `Dockerfile.base`：Ubuntu 24.04 + uv + Python 3.11 + 系统依赖
+- `Dockerfile.sandbox`：基于 base 镜像安装 `requirements.lock` 并复制 `sandbox_runtime`
+
+默认沙箱镜像标签是 `code-executor-sandbox:v2.0.0`，可通过环境变量 `SANDBOX_DOCKER_IMAGE` 覆盖。
 
 服务跑在 `http://localhost:8080`。网关进程会自动拉起 6 个预热沙箱容器。
 

@@ -193,8 +193,13 @@ class NetworkController:
         """
         if self._client is None:
             try:
+                probe_client = docker.DockerClient(
+                    base_url=self._docker_socket,
+                    timeout=max(5, min(settings.timeout.sandbox_startup_timeout, 10)),
+                )
+                probe_client.ping()
+                probe_client.close()
                 self._client = docker.DockerClient(base_url=self._docker_socket)
-                self._client.ping()
                 logger.debug("网络控制器 Docker 客户端连接成功")
             except Exception as e:
                 logger.error(f"无法连接到 Docker daemon: {e}")

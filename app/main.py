@@ -16,18 +16,29 @@ Requirements:
 """
 
 import base64
+import hashlib
+import json
 import logging
 import os
+import asyncio
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from datetime import datetime
+from typing import Any, AsyncIterator, List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
+
+try:
+    import sentry_sdk
+except ImportError:  # pragma: no cover - optional dependency
+    sentry_sdk = None
 
 from .config import settings
 from .executor import session_manager, StatelessSession
+from .models.code_context import CodeContext
+from .services.context_manager import ContextManager
 from .services.sandbox_manager import SandboxManager, SandboxState
 from .services.session_store import SessionStore, get_session_store
 from .services.health_monitor import HealthMonitor, get_health_monitor
@@ -42,6 +53,86 @@ _sandbox_manager: Optional[SandboxManager] = None
 _session_store: Optional[SessionStore] = None
 _health_monitor: Optional[HealthMonitor] = None
 _execution_queue: Optional[ExecutionQueue] = None
+_context_manager: Optional[ContextManager] = None
+
+
+def _execution_code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
+
+
+def _log_execution_event(
+    event: str,
+    *,
+    session_id: str,
+    context_id: Optional[str],
+    container_id: Optional[str],
+    code: str,
+    duration_ms: Optional[int] = None,
+    success: Optional[bool] = None,
+    chart_count: Optional[int] = None,
+    table_count: Optional[int] = None,
+) -> None:
+    payload = {
+        "event": event,
+        "session_id": session_id,
+        "context_id": context_id,
+        "container_id": container_id,
+        "code_hash": _execution_code_hash(code),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    if success is not None:
+        payload["success"] = success
+    if chart_count is not None:
+        payload["chart_count"] = chart_count
+    if table_count is not None:
+        payload["table_count"] = table_count
+    logger.info(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def _should_report_failure_to_sentry(result: dict[str, Any]) -> bool:
+    error_text = str(result.get("error") or result.get("stderr") or "").lower()
+    return any(token in error_text for token in ("oom", "out of memory", "timeout", "timed out", "killed", "crash", "segfault", "超时"))
+
+
+async def _report_execution_failure_to_sentry(
+    *,
+    session_id: str,
+    container_id: Optional[str],
+    result: dict[str, Any],
+) -> None:
+    if not sentry_sdk or not settings.sentry_dsn or not container_id or not _sandbox_manager:
+        return
+    if not _should_report_failure_to_sentry(result):
+        return
+
+    logs_tail = {"stdout": "", "stderr": ""}
+    try:
+        logs_tail = await _sandbox_manager._docker_client.get_container_logs_tail(container_id)
+    except Exception as exc:  # pragma: no cover - best effort diagnostics
+        logger.warning(f"读取容器日志尾部失败: {exc}")
+
+    with sentry_sdk.push_scope() as scope:
+        scope.set_tag("session_id", session_id)
+        scope.set_tag("container_id", container_id)
+        scope.set_context("container_logs", logs_tail)
+        scope.set_context(
+            "execution_result",
+            {
+                "success": result.get("success", False),
+                "error": result.get("error"),
+                "stderr": (result.get("stderr") or "")[-1024:],
+                "stdout": (result.get("stdout") or "")[-1024:],
+            },
+        )
+        sentry_sdk.capture_exception(RuntimeError(result.get("error") or "sandbox execution failed"))
+
+
+def _require_admin_token(admin_token: Optional[str]) -> None:
+    expected = (settings.admin_token or "").strip()
+    if not expected or admin_token != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
 
 
 def get_sandbox_manager() -> SandboxManager:
@@ -60,7 +151,7 @@ async def lifespan(app: FastAPI):
     启动时初始化沙箱管理器、会话存储和健康监控器。
     关闭时清理所有资源。
     """
-    global _sandbox_manager, _session_store, _health_monitor, _execution_queue
+    global _sandbox_manager, _session_store, _health_monitor, _execution_queue, _context_manager
 
     logger.info("Code Executor Service 启动中...")
 
@@ -77,9 +168,18 @@ async def lifespan(app: FastAPI):
     # 初始化会话存储
     _session_store = get_session_store()
     logger.info("会话存储初始化完成")
+
+    _context_manager = ContextManager()
+    logger.info("上下文管理器初始化完成")
     
     # 初始化健康监控器
     _health_monitor = get_health_monitor()
+
+    if sentry_sdk and settings.sentry_dsn:
+        sentry_sdk.init(
+            dsn=settings.sentry_dsn,
+            traces_sample_rate=settings.sentry_traces_sample_rate,
+        )
     
     # 初始化沙箱管理器（可选，根据环境决定是否启用 Docker 沙箱）
     try:
@@ -174,6 +274,12 @@ class ExecuteCodeRequest(BaseModel):
     """执行代码请求"""
     code: str
     timeout: int = 300
+    context_id: Optional[str] = None
+    # multi-table-analysis (executor_protocol_multitable.md):
+    # 可选字段；成对出现。base64 编码的 parquet 字节 + backend 渲染的
+    # DataLoaderBootstrap Python 源码。
+    pre_load_parquet: Optional[dict] = None
+    bootstrap_source: Optional[str] = None
 
 
 class ChartData(BaseModel):
@@ -254,7 +360,11 @@ class StatelessExecuteRequest(BaseModel):
     """无状态执行请求（即用即毁模式）"""
     code: str
     timeout: int = 30
+    context_id: Optional[str] = None
     data_files: Optional[dict] = None  # {filename: base64_content}
+    # multi-table-analysis
+    pre_load_parquet: Optional[dict] = None
+    bootstrap_source: Optional[str] = None
 
 
 class LoadDataRequest(BaseModel):
@@ -290,6 +400,91 @@ class MultiTableContextResponse(BaseModel):
     total_rows: int
     common_columns: dict
     suggested_joins: List[dict]
+
+
+class CreateContextRequest(BaseModel):
+    """创建代码上下文请求"""
+    fork_from: Optional[str] = None
+    language: str = "python"
+
+
+class ContextResponse(BaseModel):
+    """代码上下文响应"""
+    context_id: str
+    session_id: str
+    language: str
+    created_at: datetime
+    last_used_at: datetime
+    parent_context_id: Optional[str] = None
+
+
+def _require_context_manager() -> ContextManager:
+    if _context_manager is None:
+        raise HTTPException(status_code=503, detail="上下文管理器未初始化")
+    return _context_manager
+
+
+def _serialize_context(context: CodeContext) -> ContextResponse:
+    return ContextResponse(
+        context_id=context.context_id,
+        session_id=context.session_id,
+        language=context.language,
+        created_at=context.created_at,
+        last_used_at=context.last_used_at,
+        parent_context_id=context.parent_context_id,
+    )
+
+
+def _ensure_default_context(session_id: str) -> CodeContext:
+    context_manager = _require_context_manager()
+    existing = context_manager.list_contexts(session_id)
+    if existing:
+        return existing[0]
+    return context_manager.create_context(session_id=session_id)
+
+
+def _resolve_execute_context_id(session_id: str, requested_context_id: Optional[str]) -> str:
+    context_manager = _require_context_manager()
+    if requested_context_id:
+        context = context_manager.get_context(requested_context_id)
+        if context is None or context.session_id != session_id:
+            raise HTTPException(status_code=404, detail="Context not found")
+        context.touch()
+        return context.context_id
+    return _ensure_default_context(session_id).context_id
+
+
+def _render_context_bootstrap(
+    context: CodeContext,
+    *,
+    data_dir: str,
+    output_dir: str,
+) -> Optional[str]:
+    if not context.data_refs:
+        return None
+    refs_json = json.dumps(list(context.data_refs), ensure_ascii=False)
+    focus_json = json.dumps(context.focus_ref, ensure_ascii=False)
+    return f"""
+import json as _ctx_json
+import pandas as pd
+
+DATA_DIR = r'{data_dir}'
+OUTPUT_DIR = r'{output_dir}'
+TABLE_REFS = _ctx_json.loads({refs_json!r})
+FOCUS_REF = _ctx_json.loads({focus_json!r})
+_loaded_tables = {{}}
+
+for _ref in TABLE_REFS:
+    _loaded_tables[_ref] = pd.read_parquet(f"{{DATA_DIR}}/{{_ref}}.parquet", engine="pyarrow")
+    globals()[_ref] = _loaded_tables[_ref]
+
+if FOCUS_REF and FOCUS_REF in _loaded_tables:
+    df = _loaded_tables[FOCUS_REF]
+elif TABLE_REFS:
+    df = _loaded_tables[min(TABLE_REFS)]
+else:
+    df = pd.DataFrame()
+""".strip()
 
 
 # ===== 健康检查和指标端点 =====
@@ -398,6 +593,33 @@ async def create_session(request: CreateSessionRequest):
     )
 
 
+@app.get("/sessions/{session_id}/contexts", response_model=List[ContextResponse])
+async def list_session_contexts(session_id: str):
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    context_manager = _require_context_manager()
+    return [_serialize_context(context) for context in context_manager.list_contexts(session_id)]
+
+
+@app.post("/sessions/{session_id}/contexts", response_model=ContextResponse)
+async def create_session_context(session_id: str, request: CreateContextRequest):
+    session = session_manager.get_or_create_session(session_id)
+    if _session_store:
+        await _session_store.update_activity(session.session_id)
+    context_manager = _require_context_manager()
+    if request.fork_from:
+        fork_source = context_manager.get_context(request.fork_from)
+        if fork_source is None or fork_source.session_id != session_id:
+            raise HTTPException(status_code=404, detail="Fork source context not found")
+    context = context_manager.create_context(
+        session_id=session_id,
+        fork_from=request.fork_from,
+        language=request.language,
+    )
+    return _serialize_context(context)
+
+
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str):
     """
@@ -449,8 +671,25 @@ async def delete_session(session_id: str):
     success = session_manager.delete_session(session_id)
     if not success:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    if _context_manager:
+        for context in list(_context_manager.list_contexts(session_id)):
+            _context_manager.delete_context(context.context_id)
     
     return {"success": True, "message": f"Session {session_id} deleted"}
+
+
+@app.delete("/sessions/{session_id}/contexts/{context_id}", status_code=204)
+async def delete_session_context(session_id: str, context_id: str):
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    context_manager = _require_context_manager()
+    context = context_manager.get_context(context_id)
+    if context is None or context.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Context not found")
+    context_manager.delete_context(context_id)
+    return Response(status_code=204)
 
 
 # ===== 代码执行 API =====
@@ -530,6 +769,152 @@ def _build_execution_info(
     )
 
 
+def _encode_sse(event_type: str, data: dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+def _record_execution_metrics(result: dict[str, Any]) -> None:
+    if not _health_monitor or not isinstance(result, dict):
+        return
+    _health_monitor.record_execution(
+        duration_seconds=max(0.0, float(result.get("execution_time_ms", 0) or 0) / 1000.0),
+        success=bool(result.get("success", False)),
+    )
+
+
+async def _yield_result_as_events(result: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    stdout = result.get("stdout") or ""
+    if stdout:
+        yield {"type": "stdout", "text": stdout}
+
+    stderr = result.get("stderr") or ""
+    if stderr:
+        yield {"type": "stderr", "text": stderr}
+
+    for chart in result.get("charts", []) or []:
+        yield {"type": "chart", "chart": chart}
+
+    for table in result.get("tables", []) or []:
+        yield {"type": "table", "table": table}
+
+    if result.get("error"):
+        yield {"type": "error", "error": result.get("error")}
+
+    yield {
+        "type": "done",
+        "success": result.get("success", False),
+        "error": result.get("error"),
+        "execution_time_ms": result.get("execution_time_ms", 0),
+        "context_id": result.get("context_id"),
+        "timed_out": "超时" in (result.get("error") or ""),
+    }
+
+
+async def _execute_streaming(session_id: str, request: ExecuteCodeRequest) -> AsyncIterator[str]:
+    session = session_manager.get_or_create_session(session_id)
+    if _session_store:
+        await _session_store.update_activity(session_id)
+
+    request.context_id = _resolve_execute_context_id(session_id, request.context_id)
+    context = _require_context_manager().get_context(request.context_id)
+    start_sandbox = await _sandbox_manager.get_sandbox_by_session(session_id) if _sandbox_manager else None
+    _log_execution_event(
+        "execute_start",
+        session_id=session_id,
+        context_id=request.context_id,
+        container_id=start_sandbox.container_id if start_sandbox else None,
+        code=request.code,
+    )
+    if context and request.pre_load_parquet:
+        refs = tuple(sorted(request.pre_load_parquet.keys()))
+        context.data_refs = refs
+        if refs and (context.focus_ref is None or context.focus_ref not in refs):
+            context.focus_ref = min(refs)
+        context.touch()
+
+    async def _stream_kernel_events() -> AsyncIterator[dict[str, Any]]:
+        if request.pre_load_parquet and not request.bootstrap_source:
+            yield {
+                "type": "error",
+                "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
+            }
+            yield {
+                "type": "done",
+                "success": False,
+                "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
+                "execution_time_ms": 0,
+                "context_id": request.context_id,
+                "timed_out": False,
+            }
+            return
+
+        if _sandbox_manager:
+            sandbox_info = await _sandbox_manager.get_sandbox_by_session(session_id)
+            if sandbox_info:
+                bootstrap_source = request.bootstrap_source
+                if bootstrap_source is None and context is not None:
+                    bootstrap_source = _render_context_bootstrap(
+                        context,
+                        data_dir="/data",
+                        output_dir="/output",
+                    )
+                async for event in _sandbox_manager.stream_execute_code(
+                    sandbox_id=sandbox_info.sandbox_id,
+                    code=request.code,
+                    timeout=request.timeout,
+                    pre_load_parquet=request.pre_load_parquet,
+                    bootstrap_source=bootstrap_source,
+                    context_id=request.context_id,
+                ):
+                    yield event
+                return
+
+        result, _, _ = await _do_execute_code(session_id, session, request)
+        async for event in _yield_result_as_events(result):
+            yield event
+
+    if _execution_queue:
+        async with _execution_queue.acquire(session_id) as ticket:
+            yield _encode_sse("queue", _build_queue_info(ticket).model_dump())
+            async for event in _stream_kernel_events():
+                if event.get("type") == "done":
+                    _record_execution_metrics(
+                        {
+                            "success": event.get("success", False),
+                            "execution_time_ms": event.get("execution_time_ms", 0),
+                        }
+                    )
+
+
+                    _log_execution_event(
+                        "execute_end",
+                        session_id=session_id,
+                        context_id=request.context_id,
+                        container_id=start_sandbox.container_id if start_sandbox else None,
+                        code=request.code,
+                        duration_ms=int(event.get("execution_time_ms", 0) or 0),
+                        success=bool(event.get("success", False)),
+                        chart_count=1 if event.get("chart") else 0,
+                        table_count=1 if event.get("table") else 0,
+                    )
+                    if not event.get("success", False):
+                        await _report_execution_failure_to_sentry(
+                            session_id=session_id,
+                            container_id=start_sandbox.container_id if start_sandbox else None,
+                            result={
+                                "success": event.get("success", False),
+                                "error": event.get("error"),
+                                "execution_time_ms": event.get("execution_time_ms", 0),
+                            },
+                        )
+                yield _encode_sse(event.get("type", "message"), event)
+                await asyncio.sleep(0)
+    else:
+        async for event in _stream_kernel_events():
+            yield _encode_sse(event.get("type", "message"), event)
+            await asyncio.sleep(0)
+
+
 @app.post("/sessions/{session_id}/execute", response_model=ExecuteCodeResponse)
 async def execute_code(session_id: str, request: ExecuteCodeRequest):
     """
@@ -546,9 +931,46 @@ async def execute_code(session_id: str, request: ExecuteCodeRequest):
     if _session_store:
         await _session_store.update_activity(session_id)
 
+    request.context_id = _resolve_execute_context_id(session_id, request.context_id)
+    context = _require_context_manager().get_context(request.context_id)
+    start_sandbox = await _sandbox_manager.get_sandbox_by_session(session_id) if _sandbox_manager else None
+    _log_execution_event(
+        "execute_start",
+        session_id=session_id,
+        context_id=request.context_id,
+        container_id=start_sandbox.container_id if start_sandbox else None,
+        code=request.code,
+    )
+    if context and request.pre_load_parquet:
+        refs = tuple(sorted(request.pre_load_parquet.keys()))
+        context.data_refs = refs
+        if refs and (context.focus_ref is None or context.focus_ref not in refs):
+            context.focus_ref = min(refs)
+        context.touch()
+
     if _execution_queue:
         async with _execution_queue.acquire(session_id) as ticket:
             result, exec_path, sb_info = await _do_execute_code(session_id, session, request)
+            _record_execution_metrics(result)
+
+
+            _log_execution_event(
+                "execute_end",
+                session_id=session_id,
+                context_id=request.context_id,
+                container_id=sb_info.container_id if sb_info else (start_sandbox.container_id if start_sandbox else None),
+                code=request.code,
+                duration_ms=int(result.get("execution_time_ms", 0) or 0),
+                success=bool(result.get("success", False)),
+                chart_count=len(result.get("charts", []) or []),
+                table_count=len(result.get("tables", []) or []),
+            )
+            if not result.get("success", False):
+                await _report_execution_failure_to_sentry(
+                    session_id=session_id,
+                    container_id=sb_info.container_id if sb_info else (start_sandbox.container_id if start_sandbox else None),
+                    result=result,
+                )
             queue_info = _build_queue_info(ticket)
             sandbox_info = await _build_sandbox_info(session_id, mode=exec_path, sandbox_info_obj=sb_info)
             exec_info = _build_execution_info(result, code=request.code, timeout=request.timeout, execution_path=exec_path)
@@ -560,6 +982,26 @@ async def execute_code(session_id: str, request: ExecuteCodeRequest):
             return result
     else:
         result, exec_path, sb_info = await _do_execute_code(session_id, session, request)
+        _record_execution_metrics(result)
+
+
+        _log_execution_event(
+            "execute_end",
+            session_id=session_id,
+            context_id=request.context_id,
+            container_id=sb_info.container_id if sb_info else (start_sandbox.container_id if start_sandbox else None),
+            code=request.code,
+            duration_ms=int(result.get("execution_time_ms", 0) or 0),
+            success=bool(result.get("success", False)),
+            chart_count=len(result.get("charts", []) or []),
+            table_count=len(result.get("tables", []) or []),
+        )
+        if not result.get("success", False):
+            await _report_execution_failure_to_sentry(
+                session_id=session_id,
+                container_id=sb_info.container_id if sb_info else (start_sandbox.container_id if start_sandbox else None),
+                result=result,
+            )
         sandbox_info = await _build_sandbox_info(session_id, mode=exec_path, sandbox_info_obj=sb_info)
         exec_info = _build_execution_info(result, code=request.code, timeout=request.timeout, execution_path=exec_path)
         if isinstance(result, dict):
@@ -567,6 +1009,18 @@ async def execute_code(session_id: str, request: ExecuteCodeRequest):
             result["execution_info"] = exec_info
             return ExecuteCodeResponse(**result)
         return result
+
+
+@app.post("/v2/sessions/{session_id}/execute")
+async def execute_code_stream_v2(session_id: str, request: ExecuteCodeRequest):
+    return StreamingResponse(
+        _execute_streaming(session_id, request),
+        media_type="text/event-stream; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 async def _do_execute_code(session_id: str, session, request: ExecuteCodeRequest):
@@ -577,14 +1031,42 @@ async def _do_execute_code(session_id: str, session, request: ExecuteCodeRequest
     Returns:
         (result_dict, execution_path, sandbox_info_obj_or_None)
     """
+    # multi-table-analysis: 协议合约—pre_load_parquet 必须与 bootstrap_source 配对
+    if request.pre_load_parquet and not request.bootstrap_source:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "pre_load_parquet provided without bootstrap_source",
+            "output": "[ProtocolError]: pre_load_parquet requires bootstrap_source",
+            "charts": [],
+            "tables": [],
+            "images": [],
+            "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
+            "execution_time_ms": 0,
+        }, "protocol_error", None
+
+    context = None
+    if request.context_id and _context_manager:
+        context = _context_manager.get_context(request.context_id)
+
     if _sandbox_manager:
         sandbox_info = await _sandbox_manager.get_sandbox_by_session(session_id)
         if sandbox_info:
             try:
+                bootstrap_source = request.bootstrap_source
+                if bootstrap_source is None and context is not None:
+                    bootstrap_source = _render_context_bootstrap(
+                        context,
+                        data_dir="/data",
+                        output_dir="/output",
+                    )
                 result = await _sandbox_manager.execute_code(
                     sandbox_id=sandbox_info.sandbox_id,
                     code=request.code,
                     timeout=request.timeout,
+                    pre_load_parquet=request.pre_load_parquet,
+                    bootstrap_source=bootstrap_source,
+                    context_id=request.context_id,
                 )
                 return result, "sandbox_kernel", sandbox_info
             except Exception as e:
@@ -616,7 +1098,37 @@ async def _do_execute_code(session_id: str, session, request: ExecuteCodeRequest
             "execution_time_ms": 0,
         }, "sandbox_unavailable", None
 
-    result = await session.execute_code(request.code, request.timeout)
+    # 本地 fallback：把 pre_load_parquet 落到 session.data_dir 供 bootstrap_source 读
+    if request.pre_load_parquet:
+        import base64 as _b64
+        os.makedirs(session.data_dir, exist_ok=True)
+        for ref, b64_content in request.pre_load_parquet.items():
+            safe_ref = os.path.basename(ref)
+            if not safe_ref or safe_ref != ref:
+                logger.warning(f"[REST] skip invalid ref={ref!r}")
+                continue
+            try:
+                raw = _b64.b64decode(b64_content)
+            except Exception as e:
+                logger.warning(f"[REST] decode parquet failed ref={ref}: {e}")
+                continue
+            with open(os.path.join(session.data_dir, f"{safe_ref}.parquet"), "wb") as f:
+                f.write(raw)
+
+    result = await session.execute_code(
+        request.code,
+        request.timeout,
+        bootstrap_source=request.bootstrap_source
+        or (
+            _render_context_bootstrap(
+                context,
+                data_dir=session.data_dir,
+                output_dir=session.output_dir,
+            )
+            if context is not None
+            else None
+        ),
+    )
     return result, "local_subprocess", None
 
 
@@ -948,17 +1460,50 @@ async def execute_stateless(request: StatelessExecuteRequest):
                 detail=f"数据文件总大小超过限制（{settings.fire_and_forget.max_data_size_mb}MB）"
             )
 
+    # multi-table-analysis: 协议合约
+    if request.pre_load_parquet and not request.bootstrap_source:
+        raise HTTPException(
+            status_code=400,
+            detail="pre_load_parquet provided without bootstrap_source",
+        )
+
     exec_path = "unknown"
+    _log_execution_event(
+        "execute_start",
+        session_id="stateless",
+        context_id=request.context_id,
+        container_id=None,
+        code=request.code,
+    )
 
     async def _do_execute():
         nonlocal exec_path
         if _sandbox_manager:
             exec_path = "stateless_pool_kernel"
-            return await _sandbox_manager.execute_stateless(
-                code=request.code,
-                data_files=request.data_files,
-                timeout=request.timeout,
-            )
+            try:
+                return await _sandbox_manager.execute_stateless(
+                    code=request.code,
+                    data_files=request.data_files,
+                    timeout=request.timeout,
+                    pre_load_parquet=request.pre_load_parquet,
+                    bootstrap_source=request.bootstrap_source,
+                    context_id=request.context_id,
+                )
+            except Exception as e:
+                if not settings.allow_local_fallback:
+                    logger.error(f"无状态沙箱执行失败，本地回退已禁用: {e}")
+                    return {
+                        "success": False,
+                        "stdout": "",
+                        "stderr": str(e),
+                        "output": f"[SandboxError]: {e}",
+                        "charts": [],
+                        "tables": [],
+                        "images": [],
+                        "error": f"Sandbox execution failed: {e}",
+                        "execution_time_ms": 0,
+                    }
+                logger.error(f"无状态沙箱执行失败，回退到本地执行: {e}")
 
         if not settings.allow_local_fallback:
             exec_path = "sandbox_unavailable"
@@ -983,13 +1528,49 @@ async def execute_stateless(request: StatelessExecuteRequest):
                 for fname, b64_content in request.data_files.items():
                     file_bytes = base64.b64decode(b64_content)
                     await tmp_session.load_file(file_bytes, fname)
-            return await tmp_session.execute_code(request.code, request.timeout)
+            # multi-table-analysis: 本地 fallback 下把 parquet 落到 tmp session
+            if request.pre_load_parquet:
+                os.makedirs(tmp_session.data_dir, exist_ok=True)
+                for ref, b64_content in request.pre_load_parquet.items():
+                    safe_ref = os.path.basename(ref)
+                    if not safe_ref or safe_ref != ref:
+                        logger.warning(f"[stateless] skip invalid ref={ref!r}")
+                        continue
+                    try:
+                        raw = base64.b64decode(b64_content)
+                    except Exception as e:
+                        logger.warning(f"[stateless] decode parquet failed ref={ref}: {e}")
+                        continue
+                    with open(
+                        os.path.join(tmp_session.data_dir, f"{safe_ref}.parquet"),
+                        "wb",
+                    ) as f:
+                        f.write(raw)
+            return await tmp_session.execute_code(
+                request.code,
+                request.timeout,
+                bootstrap_source=request.bootstrap_source,
+            )
         finally:
             session_manager.delete_session(tmp_session_id)
 
     if _execution_queue:
         async with _execution_queue.acquire("stateless") as ticket:
             result = await _do_execute()
+            _record_execution_metrics(result)
+
+
+            _log_execution_event(
+                "execute_end",
+                session_id="stateless",
+                context_id=request.context_id,
+                container_id=None,
+                code=request.code,
+                duration_ms=int(result.get("execution_time_ms", 0) or 0),
+                success=bool(result.get("success", False)),
+                chart_count=len(result.get("charts", []) or []),
+                table_count=len(result.get("tables", []) or []),
+            )
             queue_info = _build_queue_info(ticket)
             sandbox_info = await _build_sandbox_info("stateless", mode=exec_path)
             exec_info = _build_execution_info(result, code=request.code, timeout=request.timeout, execution_path=exec_path)
@@ -999,11 +1580,50 @@ async def execute_stateless(request: StatelessExecuteRequest):
             return ExecuteCodeResponse(**result)
     else:
         result = await _do_execute()
+        _record_execution_metrics(result)
+
+
+        _log_execution_event(
+            "execute_end",
+            session_id="stateless",
+            context_id=request.context_id,
+            container_id=None,
+            code=request.code,
+            duration_ms=int(result.get("execution_time_ms", 0) or 0),
+            success=bool(result.get("success", False)),
+            chart_count=len(result.get("charts", []) or []),
+            table_count=len(result.get("tables", []) or []),
+        )
         sandbox_info = await _build_sandbox_info("stateless", mode=exec_path)
         exec_info = _build_execution_info(result, code=request.code, timeout=request.timeout, execution_path=exec_path)
         result["sandbox_info"] = sandbox_info
         result["execution_info"] = exec_info
         return ExecuteCodeResponse(**result)
+
+
+@app.get("/admin/sandboxes")
+async def admin_list_sandboxes(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")):
+    _require_admin_token(x_admin_token)
+    if not _sandbox_manager:
+        return []
+
+    sandboxes = await _sandbox_manager.list_sandboxes()
+    items = []
+    for sandbox in sandboxes:
+        metrics = await _health_monitor.get_sandbox_metrics(sandbox.sandbox_id) if _health_monitor else None
+        context_count = len(_context_manager.list_contexts(sandbox.session_id)) if _context_manager else 0
+        items.append(
+            {
+                "container_id": sandbox.container_id,
+                "session_id": sandbox.session_id,
+                "context_count": context_count,
+                "created_at": sandbox.created_at.isoformat(),
+                "last_execution_at": sandbox.last_activity.isoformat(),
+                "cpu_usage": round(metrics.cpu_percent, 2) if metrics else 0.0,
+                "memory_mb": round(metrics.memory_used_mb, 2) if metrics else 0.0,
+            }
+        )
+    return items
 
 
 if __name__ == "__main__":

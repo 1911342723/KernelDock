@@ -13,6 +13,7 @@ Requirements:
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -116,8 +117,33 @@ class DockerClient:
         self._socket = docker_socket or settings.docker_socket
         self._client: Optional[docker.DockerClient] = None
         self._lock = asyncio.Lock()
+        self._control_plane_timeout_seconds = max(
+            5,
+            min(settings.timeout.sandbox_startup_timeout, 10),
+        )
         logger.info(f"初始化 Docker 客户端，socket: {self._socket}")
 
+    async def get_container_logs_tail(
+        self,
+        container_id: str,
+        *,
+        tail: int = 200,
+        max_bytes: int = 1024,
+    ) -> Dict[str, str]:
+        """Return the last chunk of container stdout/stderr for diagnostics."""
+
+        client = await self._ensure_client()
+
+        def _fetch() -> Dict[str, str]:
+            container = client.containers.get(container_id)
+            stdout_raw = container.logs(stdout=True, stderr=False, tail=tail) or b""
+            stderr_raw = container.logs(stdout=False, stderr=True, tail=tail) or b""
+            return {
+                "stdout": stdout_raw.decode("utf-8", errors="ignore")[-max_bytes:],
+                "stderr": stderr_raw.decode("utf-8", errors="ignore")[-max_bytes:],
+            }
+
+        return await asyncio.to_thread(_fetch)
     @property
     def client(self) -> docker.DockerClient:
         """
@@ -131,9 +157,14 @@ class DockerClient:
         """
         if self._client is None:
             try:
+                probe_client = docker.DockerClient(
+                    base_url=self._socket,
+                    timeout=self._control_plane_timeout_seconds,
+                )
+                # 测试连接；使用短超时避免 daemon 卡死时把上游请求拖满 60s。
+                probe_client.ping()
+                probe_client.close()
                 self._client = docker.DockerClient(base_url=self._socket)
-                # 测试连接
-                self._client.ping()
                 logger.debug("Docker 客户端连接成功")
             except Exception as e:
                 logger.error(f"无法连接到 Docker daemon: {e}")
@@ -276,9 +307,12 @@ class DockerClient:
                 logger.info(f"使用运行时: {runtime}")
             
             # 在线程池中创建容器
-            container = await self._run_in_executor(
-                self.client.containers.create,
-                **container_config
+            container = await asyncio.wait_for(
+                self._run_in_executor(
+                    self.client.containers.create,
+                    **container_config
+                ),
+                timeout=self._control_plane_timeout_seconds,
             )
             
             logger.info(f"容器创建成功，ID: {container.id[:12]}")
@@ -295,6 +329,14 @@ class DockerClient:
             raise SandboxCreationError(
                 reason=f"Docker API 错误: {e.explanation}",
                 original_error=str(e)
+            )
+        except asyncio.TimeoutError as e:
+            logger.error(
+                f"创建容器超时: socket={self._socket}, timeout={self._control_plane_timeout_seconds}s"
+            )
+            raise SandboxCreationError(
+                reason=f"Docker daemon 响应超时（>{self._control_plane_timeout_seconds}秒）",
+                original_error=str(e),
             )
         except Exception as e:
             logger.error(f"创建容器失败: {e}")
@@ -319,10 +361,22 @@ class DockerClient:
         try:
             logger.info(f"启动容器: {container_id[:12] if len(container_id) > 12 else container_id}")
             container = await self._get_container(container_id)
-            await self._run_in_executor(container.start)
+            await asyncio.wait_for(
+                self._run_in_executor(container.start),
+                timeout=self._control_plane_timeout_seconds,
+            )
             logger.info(f"容器启动成功: {container_id[:12] if len(container_id) > 12 else container_id}")
         except SandboxNotFoundError:
             raise
+        except asyncio.TimeoutError as e:
+            logger.error(
+                f"启动容器超时: container={container_id[:12] if len(container_id) > 12 else container_id}, "
+                f"timeout={self._control_plane_timeout_seconds}s"
+            )
+            raise SandboxCreationError(
+                reason=f"Docker daemon 启动容器超时（>{self._control_plane_timeout_seconds}秒）",
+                original_error=str(e),
+            )
         except APIError as e:
             logger.error(f"启动容器失败: {e}")
             raise SandboxCreationError(
@@ -521,6 +575,51 @@ class DockerClient:
             raise InternalError(
                 message=f"执行命令失败: {str(e)}",
                 original_error=e
+            )
+
+    async def exec_command_stream(
+        self,
+        container_id: str,
+        command: str | List[str],
+        user: Optional[str] = None,
+        workdir: Optional[str] = None,
+        environment: Optional[Dict[str, str]] = None,
+    ) -> AsyncIterator[tuple[bytes, bytes]]:
+        """在容器内流式执行命令，按块返回 stdout/stderr。"""
+        try:
+            container = await self._get_container(container_id)
+            exec_kwargs = {
+                "cmd": command if isinstance(command, list) else ["/bin/sh", "-c", command],
+                "stdout": True,
+                "stderr": True,
+                "demux": True,
+                "stream": True,
+            }
+            if user:
+                exec_kwargs["user"] = user
+            if workdir:
+                exec_kwargs["workdir"] = workdir
+            if environment:
+                exec_kwargs["environment"] = environment
+
+            stream_result = await self._run_in_executor(container.exec_run, **exec_kwargs)
+            iterator = stream_result.output
+            while True:
+                try:
+                    chunk = await self._run_in_executor(next, iterator)
+                except StopIteration:
+                    break
+                if isinstance(chunk, tuple):
+                    yield chunk
+                else:
+                    yield chunk or b"", b""
+        except SandboxNotFoundError:
+            raise
+        except Exception as e:
+            logger.error(f"流式执行命令失败: {e}")
+            raise InternalError(
+                message=f"流式执行命令失败: {str(e)}",
+                original_error=e,
             )
 
     async def get_container_status(self, container_id: str) -> ContainerInfo:

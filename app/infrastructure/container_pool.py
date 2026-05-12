@@ -129,6 +129,7 @@ class ContainerPool:
         # 容器池存储
         self._available_containers: List[PooledContainer] = []
         self._all_containers: Dict[str, PooledContainer] = {}
+        self._leased_containers: Dict[str, PooledContainer] = {}
         
         # 同步锁
         self._lock = asyncio.Lock()
@@ -192,7 +193,12 @@ class ContainerPool:
         Returns:
             容器池管理的总容器数量
         """
-        return len(self._all_containers)
+        return len(self._all_containers) + len(self._leased_containers)
+
+    @property
+    def leased_count(self) -> int:
+        """获取当前借出中的容器数量。"""
+        return len(self._leased_containers)
     
     @property
     def pool_size(self) -> int:
@@ -216,6 +222,7 @@ class ContainerPool:
             "pool_size": self._pool_size,
             "available_count": self.available_count,
             "total_count": self.total_count,
+            "leased_count": self.leased_count,
             "total_acquired": self._total_acquired,
             "total_created": self._total_created,
             "total_removed": self._total_removed,
@@ -282,9 +289,12 @@ class ContainerPool:
         async with self._lock:
             for container_id in list(self._all_containers.keys()):
                 await self._remove_container(container_id)
+            for container_id in list(self._leased_containers.keys()):
+                await self._remove_container(container_id)
             
             self._available_containers.clear()
             self._all_containers.clear()
+            self._leased_containers.clear()
         
         logger.info("容器池已关闭")
     
@@ -314,6 +324,7 @@ class ContainerPool:
                 self._available_containers.remove(container)
                 # 从总容器列表中移除（容器已被分配出去）
                 del self._all_containers[container.container_id]
+                self._leased_containers[container.container_id] = container
                 self._total_acquired += 1
                 
                 elapsed = time.monotonic() - start_time
@@ -352,6 +363,7 @@ class ContainerPool:
             if container:
                 self._available_containers.remove(container)
                 del self._all_containers[container.container_id]
+                self._leased_containers[container.container_id] = container
                 self._total_acquired += 1
 
                 elapsed = time.monotonic() - start_time
@@ -377,6 +389,11 @@ class ContainerPool:
             container_id: 容器 ID
         """
         async with self._lock:
+            leased = self._leased_containers.pop(container_id, None)
+            if leased is None:
+                logger.warning(f"容器 {container_id[:12]} 未处于借出状态，跳过回池")
+                return
+
             # 检查容器是否健康
             is_healthy = await self._check_container_health(container_id)
             
@@ -384,7 +401,7 @@ class ContainerPool:
                 # 容器健康且池未满，放回池中
                 container = PooledContainer(
                     container_id=container_id,
-                    created_at=datetime.now(),
+                    created_at=leased.created_at,
                     is_healthy=True,
                     last_health_check=datetime.now()
                 )
@@ -823,6 +840,7 @@ class ContainerPool:
                 "pool_size": self._pool_size,
                 "available_count": self.available_count,
                 "total_count": self.total_count,
+                "leased_count": self.leased_count,
                 "is_running": self._running,
                 "statistics": self.statistics,
                 "containers": containers_info,

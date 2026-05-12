@@ -11,6 +11,7 @@
 import io
 import os
 import sys
+import time
 import warnings
 from typing import Optional
 
@@ -20,6 +21,7 @@ _output_dir: str = os.environ.get('OUTPUT_DIR', '/output')
 _initialized: bool = False
 _selected_font: Optional[str] = None
 _fonts_registered: bool = False
+_eager_imported_modules: tuple[str, ...] = ()
 
 
 def get_data_dir() -> str:
@@ -37,6 +39,14 @@ def get_font_info() -> dict:
     return {
         'selected_font': _selected_font,
         'font_sans_serif': os.environ.get('MPL_FONT_SANS_SERIF', ''),
+    }
+
+
+def get_eager_import_status() -> dict:
+    """Return the modules warmed during sandbox startup."""
+    return {
+        'modules': _eager_imported_modules,
+        'count': len(_eager_imported_modules),
     }
 
 
@@ -70,6 +80,9 @@ def setup(
     # 抑制警告
     if suppress_warnings:
         warnings.filterwarnings('ignore')
+
+    # 预热常用科学计算库，把首轮 import 成本前移到容器启动阶段。
+    _eager_import_common_modules()
     
     # 配置 matplotlib
     _setup_matplotlib()
@@ -79,6 +92,40 @@ def setup(
     
     _initialized = True
     print("[OK] Sandbox runtime initialized")
+
+
+def _eager_import_common_modules() -> None:
+    """Warm up heavy analysis libraries during container startup."""
+    global _eager_imported_modules
+
+    if _eager_imported_modules:
+        return
+
+    started_at = time.monotonic()
+    warmed_modules = []
+    module_names = (
+        'pandas',
+        'numpy',
+        'matplotlib',
+        'matplotlib.pyplot',
+        'seaborn',
+        'scipy',
+        'sklearn',
+    )
+
+    for module_name in module_names:
+        try:
+            __import__(module_name)
+            warmed_modules.append(module_name)
+        except Exception as err:
+            print(f"[Warmup] skipped {module_name}: {err}")
+
+    _eager_imported_modules = tuple(warmed_modules)
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    print(
+        f"[Warmup] eager imports ready: {', '.join(_eager_imported_modules)} "
+        f"({elapsed_ms}ms)"
+    )
 
 
 def _setup_encoding() -> None:

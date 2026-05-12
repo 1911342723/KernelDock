@@ -234,6 +234,13 @@ class HealthMonitor:
         
         # 缓存的服务健康状态
         self._cached_health: Optional[ServiceHealth] = None
+
+        # 执行指标缓存
+        self._execution_histogram_buckets = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
+        self._execution_histogram_counts = [0 for _ in self._execution_histogram_buckets]
+        self._execution_count = 0
+        self._execution_sum_seconds = 0.0
+        self._execution_status_counts: Dict[str, int] = {"success": 0, "failure": 0}
         
         # 异常退出事件记录
         self._exit_events: List[ContainerExitEvent] = []
@@ -293,6 +300,17 @@ class HealthMonitor:
         """
         self._alert_callbacks.append(callback)
         logger.debug(f"注册告警回调，当前回调数: {len(self._alert_callbacks)}")
+
+    def record_execution(self, *, duration_seconds: float, success: bool) -> None:
+        duration = max(0.0, float(duration_seconds))
+        self._execution_count += 1
+        self._execution_sum_seconds += duration
+        status = "success" if success else "failure"
+        self._execution_status_counts[status] = self._execution_status_counts.get(status, 0) + 1
+        for index, bucket in enumerate(self._execution_histogram_buckets):
+            if duration <= bucket:
+                self._execution_histogram_counts[index] += 1
+                break
     
     def unregister_alert_callback(self, callback: AlertCallback) -> bool:
         """
@@ -659,6 +677,23 @@ class HealthMonitor:
             lines.append("# TYPE sandbox_pool_created_total counter")
             lines.append(f"sandbox_pool_created_total {stats.get('total_created', 0)}")
             lines.append("")
+
+        lines.append("# HELP execution_duration_seconds 代码执行耗时分布（秒）")
+        lines.append("# TYPE execution_duration_seconds histogram")
+        cumulative = 0
+        for bucket, count in zip(self._execution_histogram_buckets, self._execution_histogram_counts):
+            cumulative += count
+            lines.append(f'execution_duration_seconds_bucket{{le="{bucket}"}} {cumulative}')
+        lines.append(f'execution_duration_seconds_bucket{{le="+Inf"}} {self._execution_count}')
+        lines.append(f"execution_duration_seconds_sum {self._execution_sum_seconds:.6f}")
+        lines.append(f"execution_duration_seconds_count {self._execution_count}")
+        lines.append("")
+
+        lines.append("# HELP execution_total 代码执行次数")
+        lines.append("# TYPE execution_total counter")
+        for status, count in sorted(self._execution_status_counts.items()):
+            lines.append(f'execution_total{{status="{status}"}} {count}')
+        lines.append("")
         
         # 系统资源指标
         cpu_usage = psutil.cpu_percent(interval=0.1)
@@ -701,6 +736,16 @@ class HealthMonitor:
                 memory_bytes = int(metrics.memory_used_mb * 1024 * 1024)
                 lines.append(
                     f'sandbox_memory_used_bytes{{sandbox_id="{sandbox_id}"}} '
+                    f'{memory_bytes}'
+                )
+            lines.append("")
+
+            lines.append("# HELP container_memory_bytes 容器已用内存（字节）")
+            lines.append("# TYPE container_memory_bytes gauge")
+            for sandbox_id, metrics in self._cached_metrics.items():
+                memory_bytes = int(metrics.memory_used_mb * 1024 * 1024)
+                lines.append(
+                    f'container_memory_bytes{{sandbox_id="{sandbox_id}"}} '
                     f'{memory_bytes}'
                 )
             lines.append("")

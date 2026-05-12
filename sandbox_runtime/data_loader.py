@@ -1,173 +1,98 @@
 """
-数据加载模块
+数据加载模块 — multi-table-analysis 版本 (design §5.3)
 
-自动加载数据目录中的 CSV/Excel 文件：
-- 支持多种编码格式
-- 自动生成变量名
-- 提供加载后的表格信息查询
+新契约：
+- backend 侧已把每张 LogicalTable 序列化为 ``<data_dir>/<TableRef>.parquet``；
+- execute 请求里会带 ``bootstrap_source``（backend 渲染的自包含 Python 源码），
+  沙箱在用户代码之前 exec 该源码，负责读 parquet、注入全局、绑定 ``df``。
+- 本模块仅提供 ``load_parquet_tables`` 作为可复用 helper，以及
+  ``get_default_dataframe`` 用于 kernel 初始化时的兜底；旧的
+  filename-indexed 扫描 (``load_data_files`` / ``generate_variable_name``)
+  已删除。
 """
 
 import os
-import re
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, Iterable, Optional
 
-# 已加载的表格
+# 最近一次 ``load_parquet_tables`` 的结果（供 kernel 调试 / ``df`` 回填使用）
 _loaded_tables: Dict[str, Any] = {}
 
 
 def get_loaded_tables() -> Dict[str, Any]:
-    """获取已加载的表格字典"""
-    return _loaded_tables.copy()
+    """获取最近一次加载的表格字典（按 TableRef 索引）。"""
+    return dict(_loaded_tables)
 
 
-def generate_variable_name(filename: str) -> str:
-    """
-    根据文件名生成有效的 Python 变量名
-    
-    Args:
-        filename: 文件名
-        
-    Returns:
-        有效的 Python 变量名
-    """
-    # 移除扩展名
-    name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
-    
-    # 替换非法字符
-    var_name = re.sub(r'[^a-zA-Z0-9_]', '_', name_without_ext)
-    var_name = re.sub(r'_+', '_', var_name).strip('_')
-    
-    # 处理空名称
-    if not var_name:
-        var_name = 'df_data'
-    
-    # 处理数字开头
-    if var_name[0].isdigit():
-        var_name = 'df_' + var_name
-    
-    return var_name
-
-
-def _load_single_file(file_path: str, file_name: str):
-    """
-    加载单个数据文件
-    
-    Args:
-        file_path: 文件完整路径
-        file_name: 文件名
-        
-    Returns:
-        pandas DataFrame 或 None
-    """
-    try:
-        import pandas as pd
-        
-        if file_name.endswith('.csv'):
-            # 尝试不同编码
-            for encoding in ['utf-8', 'gbk', 'gb2312', 'latin1']:
-                try:
-                    return pd.read_csv(file_path, encoding=encoding)
-                except (UnicodeDecodeError, UnicodeError):
-                    continue
-            # 最后使用 errors='ignore'
-            return pd.read_csv(file_path, encoding='utf-8', errors='ignore')
-        
-        elif file_name.endswith(('.xlsx', '.xls')):
-            return pd.read_excel(file_path)
-        
-        else:
-            return None
-            
-    except Exception as e:
-        print(f"[Warning] 加载文件 {file_name} 失败: {e}")
-        return None
-
-
-def load_data_files(
-    data_dir: Optional[str] = None,
-    globals_dict: Optional[Dict] = None,
+def load_parquet_tables(
+    data_dir: str,
+    table_refs: Iterable[str],
+    focus_ref: Optional[str] = None,
+    globals_dict: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    加载数据目录中的所有数据文件
-    
-    自动扫描数据目录，加载 CSV 和 Excel 文件，
-    并将它们注入到指定的全局命名空间。
-    
+    """按 TableRef 读取 ``<data_dir>/<ref>.parquet`` 并注入全局。
+
     Args:
-        data_dir: 数据目录路径（可选，默认使用配置）
-        globals_dict: 全局变量字典（用于注入变量）
-        
+        data_dir: parquet 所在目录（通常 ``/data``）。
+        table_refs: 已由 backend ``WorkbookParser`` 固化的 TableRef 列表。
+        focus_ref: 焦点 ref。决定 ``df`` 绑定：
+            ``focus_ref`` in refs → ``df = _loaded_tables[focus_ref]``；
+            否则 → ``df = _loaded_tables[min(refs)]``；
+            refs 为空 → ``df = pd.DataFrame()``。
+        globals_dict: 要注入的全局命名空间；每个 ref 以 Python identifier
+            形式绑定到该 dict。
+
     Returns:
-        加载的表格字典 {文件名: DataFrame}
+        按 TableRef 索引的 DataFrame 字典（也就是 ``_loaded_tables`` 的副本）。
+
+    Raises:
+        FileNotFoundError: 任一 ref 对应的 parquet 文件缺失。
     """
+    import pandas as pd
+
     global _loaded_tables
-    
-    try:
-        import pandas as pd
-        from .setup import get_data_dir
-        
-        data_dir = data_dir or get_data_dir()
-        
-        # 检查目录是否存在
-        if not os.path.exists(data_dir):
-            print(f"[Info] 数据目录不存在: {data_dir}")
-            return {}
-        
-        _loaded_tables = {}
-        
-        # 扫描数据文件
-        data_files = sorted([
-            f for f in os.listdir(data_dir)
-            if f.endswith(('.csv', '.xlsx', '.xls'))
-        ])
-        
-        if not data_files:
-            print("[Info] 未找到数据文件")
-            return {}
-        
-        print(f"[OK] Found {len(data_files)} data file(s)")
-        
-        # 加载文件
-        for idx, file_name in enumerate(data_files):
-            file_path = os.path.join(data_dir, file_name)
-            df = _load_single_file(file_path, file_name)
-            
-            if df is not None:
-                var_name = generate_variable_name(file_name)
-                _loaded_tables[file_name] = df
-                
-                # 注入到全局命名空间
-                if globals_dict is not None:
-                    globals_dict[var_name] = df
-                
-                print(f"  [{idx + 1}] {file_name} -> {var_name}")
-        
-        return _loaded_tables
-        
-    except ImportError:
-        print("[Error] pandas 未安装，无法加载数据文件")
-        return {}
-    except Exception as e:
-        print(f"[Error] 加载数据文件失败: {e}")
-        return {}
+    loaded: Dict[str, Any] = {}
+    refs = list(table_refs)
+
+    for ref in refs:
+        path = os.path.join(data_dir, f"{ref}.parquet")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"load_parquet_tables: missing parquet for table_ref={ref!r} at {path}"
+            )
+        df = pd.read_parquet(path, engine="pyarrow")
+        loaded[ref] = df
+        if globals_dict is not None:
+            globals_dict[ref] = df
+
+    # 绑定 df
+    if focus_ref and focus_ref in loaded:
+        focal = loaded[focus_ref]
+    elif refs:
+        focal = loaded[min(refs)]
+    else:
+        focal = pd.DataFrame()
+
+    if globals_dict is not None:
+        globals_dict["df"] = focal
+        globals_dict["_loaded_tables"] = loaded
+        globals_dict["TABLE_REFS"] = refs
+        globals_dict["FOCUS_REF"] = focus_ref
+
+    _loaded_tables = loaded
+    return loaded
 
 
 def get_default_dataframe():
-    """
-    获取默认的 DataFrame
-    
-    如果有加载的表格，返回第一个；否则返回空 DataFrame。
-    
-    Returns:
-        pandas DataFrame
+    """获取默认 DataFrame（最近一次加载的第一张表；没有则返回空 DataFrame）。
+
+    留作 kernel 初始化 / 老代码回退使用。新管线优先用 bootstrap_source 的
+    焦点决议结果。
     """
     try:
         import pandas as pd
-        
+
         if _loaded_tables:
-            return list(_loaded_tables.values())[0]
-        else:
-            return pd.DataFrame()
-            
+            return next(iter(_loaded_tables.values()))
+        return pd.DataFrame()
     except ImportError:
         return None

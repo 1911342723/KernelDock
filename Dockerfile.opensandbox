@@ -1,0 +1,96 @@
+# =============================================================================
+# OpenSandbox 定制镜像 - 完整数据分析环境
+# =============================================================================
+# 直接往 OpenSandbox code-interpreter 使用的 Python 3.11 里装包。
+#
+# 构建：docker build -f Dockerfile.opensandbox -t opensandbox-dataanalysis:v1.0.2 .
+# 使用：OPENSANDBOX_IMAGE=opensandbox-dataanalysis:v1.0.2
+# =============================================================================
+
+FROM sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.0.2
+
+ARG USE_CHINA_MIRROR=1
+ARG PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+
+USER root
+
+# apt 国内源
+RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
+            /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
+    fi
+
+# 系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-noto-cjk fonts-wqy-microhei fonts-liberation fontconfig \
+    libfreetype6 libpng16-16 libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    libgdal-dev libgeos-dev libproj-dev \
+    graphviz libgraphviz-dev \
+    libcairo2 libcairo2-dev libpango-1.0-0 libpangocairo-1.0-0 \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/* && fc-cache -fv
+
+# 安装所有数据分析库到 code-interpreter 的 Python 里
+RUN /opt/python/versions/cpython-3.11.14-linux-x86_64-gnu/bin/python3 -m pip install \
+    --break-system-packages \
+    -i ${PIP_INDEX} --trusted-host pypi.tuna.tsinghua.edu.cn --no-cache-dir \
+    "pyarrow>=14.0.0,<18.0.0" \
+    "numpy>=1.24.0,<2.0.0" \
+    "polars>=0.20.0,<1.0.0" \
+    "matplotlib>=3.7.0,<4.0.0" \
+    "seaborn>=0.12.0,<1.0.0" \
+    "plotly>=5.14.0,<6.0.0" \
+    "bokeh>=3.3.0,<4.0.0" \
+    "altair>=5.2.0,<6.0.0" \
+    "pyecharts>=2.0.0,<3.0.0" \
+    "drawsvg>=2.0.0,<3.0.0" \
+    "python-ternary>=1.0.8,<2.0.0" \
+    "plotnine>=0.12.0,<1.0.0" \
+    "matplotlib-venn>=0.11.0,<1.0.0" \
+    "holoviews>=1.18.0,<2.0.0" \
+    "wordcloud>=1.9.0,<2.0.0" \
+    "squarify>=0.4.3,<1.0.0" \
+    "pygal>=3.0.0,<4.0.0" \
+    "palettable>=3.3.0,<4.0.0" \
+    "cmocean>=3.0.0,<4.0.0" \
+    "colorcet>=3.0.0,<4.0.0" \
+    "SciencePlots>=2.1.0,<3.0.0" \
+    "scipy>=1.10.0,<2.0.0" \
+    "sympy>=1.12,<2.0.0" \
+    "statsmodels>=0.14.0,<1.0.0" \
+    "pingouin>=0.5.3,<1.0.0" \
+    "scikit-learn>=1.2.0,<2.0.0" \
+    "geopandas>=0.14.0,<1.0.0" \
+    "folium>=0.15.0,<1.0.0" \
+    "shapely>=2.0.0,<3.0.0" \
+    "networkx>=3.2.0,<4.0.0" \
+    "pyvis>=0.3.0,<1.0.0" \
+    "graphviz>=0.20.0,<1.0.0" \
+    "pillow>=10.0.0,<12.0.0" \
+    "opencv-python-headless>=4.8.0,<5.0.0" \
+    "scikit-image>=0.22.0,<1.0.0" \
+    "cairosvg>=2.7.0,<3.0.0" \
+    "openpyxl>=3.1.0,<4.0.0" \
+    "xlrd>=2.0.0,<3.0.0" \
+    "xlsxwriter>=3.1.0,<4.0.0" \
+    "python-docx>=1.1.0,<2.0.0" \
+    "PyPDF2>=3.0.0,<4.0.0" \
+    "tabulate>=0.9.0,<1.0.0" \
+    "tqdm>=4.66.0,<5.0.0" \
+    "python-dateutil>=2.8.0,<3.0.0" \
+    "pytz>=2023.3" \
+    "pyyaml>=6.0.0,<7.0.0" \
+    "adjustText>=0.8,<1.0.0"
+
+# 清理编译器
+RUN apt-get purge -y --auto-remove gcc g++ \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# 验证（用 code-interpreter 的 Python）
+RUN /opt/python/versions/cpython-3.11.14-linux-x86_64-gnu/bin/python3 -c "\
+import pandas, numpy, matplotlib, seaborn, scipy, sklearn, plotly, statsmodels, pyarrow, openpyxl; \
+print('pandas', pandas.__version__); \
+print('numpy', numpy.__version__); \
+print('pyarrow', pyarrow.__version__); \
+print('matplotlib', matplotlib.__version__); \
+print('ALL OK')"

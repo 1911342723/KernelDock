@@ -373,12 +373,17 @@ class SandboxSettings(BaseSettings):
     
     # 基础配置
     docker_image: str = Field(
-        default="code-executor:latest", 
+        default="code-executor-sandbox:v2.0.0", 
         description="沙箱 Docker 镜像"
     )
     workspace_base: str = Field(
         default="/var/sandbox/workspaces", 
         description="工作空间基础目录"
+    )
+    shared_data_root: str = Field(
+        default="",
+        validation_alias="DEEPTHINK_DATA_ROOT",
+        description="后端共享分析数据目录；配置后按 <root>/<session_id> 只读挂载到 /data"
     )
     log_level: str = Field(
         default="INFO", 
@@ -405,6 +410,10 @@ class SandboxSettings(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Sentry 追踪采样率"
+    )
+    admin_token: str = Field(
+        default="",
+        description="管理端点访问 token"
     )
     allow_local_fallback: bool = Field(
         default=False,
@@ -446,7 +455,7 @@ class SandboxSettings(BaseSettings):
         如果格式无效，记录警告并使用默认值。
         Requirements: 11.6 (配置参数无效时使用默认值并记录警告日志)
         """
-        default_image = "code-executor:latest"
+        default_image = "code-executor-sandbox:v2.0.0"
         
         if not v or not v.strip():
             logger.warning(
@@ -711,7 +720,7 @@ class SandboxSettings(BaseSettings):
         }
         
         # 验证 Docker 镜像名称
-        if self.docker_image == "code-executor:latest":
+        if self.docker_image == "code-executor-sandbox:v2.0.0":
             # 检查是否是因为验证失败而使用默认值
             # 这里我们只是记录当前使用的是默认值
             pass
@@ -843,7 +852,7 @@ def _create_settings() -> SandboxSettings:
             network=SandboxNetworkConfig(),
             timeout=SandboxTimeoutConfig(),
             pool=ContainerPoolConfig(),
-            docker_image="code-executor:latest",
+            docker_image="code-executor-sandbox:v2.0.0",
             workspace_base="/var/sandbox/workspaces",
             log_level="INFO",
             docker_socket="unix:///var/run/docker.sock",

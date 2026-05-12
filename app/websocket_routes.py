@@ -165,16 +165,30 @@ async def handle_execute_code(
 
     支持实时输出推送（通过定期发送 output 消息）
     集成执行队列：排队期间每 2 秒推送位置更新
+
+    multi-table-analysis (executor_protocol_multitable.md):
+    从 ``data`` 里额外提取可选字段 ``pre_load_parquet`` /
+    ``bootstrap_source``，透传给 sandbox / session，不在此处做 I/O。
     """
     session_id = data.get("session_id")
     code = data.get("code", "")
     timeout = data.get("timeout", DEFAULT_TIMEOUT)
+    pre_load_parquet = data.get("pre_load_parquet") or None
+    bootstrap_source = data.get("bootstrap_source") or None
 
-    logger.info(f"[EXECUTE] 收到执行请求: session={session_id}, code_len={len(code)}, timeout={timeout}")
+    logger.info(
+        f"[EXECUTE] 收到执行请求: session={session_id}, code_len={len(code)}, "
+        f"timeout={timeout}, has_pre_load={bool(pre_load_parquet)}, "
+        f"has_bootstrap={bool(bootstrap_source)}"
+    )
     logger.info(f"[EXECUTE] 代码内容前200字符: {code[:200]}...")
 
     if not session_id:
         raise ValueError("session_id is required")
+
+    # 协议合约：pre_load_parquet 必须与 bootstrap_source 配对
+    if pre_load_parquet and not bootstrap_source:
+        raise ValueError("pre_load_parquet provided without bootstrap_source")
 
     session = session_manager.get_or_create_session(session_id)
     connection_manager.bind_session(session_id, connection_id)
@@ -243,16 +257,34 @@ async def handle_execute_code(
                     })
                 except Exception:
                     pass
-                result = await _do_execute(session_id, session, code, timeout, websocket, connection_id)
+                result = await _do_execute(
+                    session_id, session, code, timeout, websocket, connection_id,
+                    pre_load_parquet=pre_load_parquet,
+                    bootstrap_source=bootstrap_source,
+                )
                 return result
         finally:
             # 清理回调
             _execution_queue.unregister_position_callback(session_id)
     else:
-        return await _do_execute(session_id, session, code, timeout, websocket, connection_id)
+        return await _do_execute(
+            session_id, session, code, timeout, websocket, connection_id,
+            pre_load_parquet=pre_load_parquet,
+            bootstrap_source=bootstrap_source,
+        )
 
 
-async def _do_execute(session_id, session, code, timeout, websocket, connection_id):
+async def _do_execute(
+    session_id,
+    session,
+    code,
+    timeout,
+    websocket,
+    connection_id,
+    *,
+    pre_load_parquet: Optional[Dict[str, Any]] = None,
+    bootstrap_source: Optional[str] = None,
+):
     """实际执行代码逻辑（从 handle_execute_code 提取）"""
     # 检查是否使用沙箱
     if _sandbox_manager:
@@ -264,7 +296,9 @@ async def _do_execute(session_id, session, code, timeout, websocket, connection_
                 result = await _sandbox_manager.execute_code(
                     sandbox_id=sandbox_info.sandbox_id,
                     code=code,
-                    timeout=timeout
+                    timeout=timeout,
+                    pre_load_parquet=pre_load_parquet,
+                    bootstrap_source=bootstrap_source,
                 )
                 logger.info(f"[EXECUTE] 沙箱执行完成: success={result.get('success')}")
                 return result
@@ -306,13 +340,34 @@ async def _do_execute(session_id, session, code, timeout, websocket, connection_
             "data": {"stdout": text}
         })
 
+    # multi-table-analysis: 本地 fallback 下没有容器 /data，
+    # 如果 client 带了 pre_load_parquet，把它们落到 session.data_dir
+    # 供 bootstrap_source 读。
+    if pre_load_parquet:
+        import base64 as _b64
+        import os as _os
+        _os.makedirs(session.data_dir, exist_ok=True)
+        for ref, b64_content in pre_load_parquet.items():
+            safe_ref = _os.path.basename(ref)
+            if not safe_ref or safe_ref != ref:
+                logger.warning(f"[EXECUTE] skip invalid ref={ref!r}")
+                continue
+            try:
+                raw = _b64.b64decode(b64_content)
+            except Exception as e:
+                logger.warning(f"[EXECUTE] decode parquet failed ref={ref}: {e}")
+                continue
+            with open(_os.path.join(session.data_dir, f"{safe_ref}.parquet"), "wb") as f:
+                f.write(raw)
+
     import time as _time
     start_time = _time.time()
     result = await session.execute_code(
         code,
         timeout,
         on_stdout=on_output,
-        on_stderr=on_output
+        on_stderr=on_output,
+        bootstrap_source=bootstrap_source,
     )
     elapsed = _time.time() - start_time
     logger.info(f"[EXECUTE] 本地执行完成: success={result.get('success')}, elapsed={elapsed:.2f}s")

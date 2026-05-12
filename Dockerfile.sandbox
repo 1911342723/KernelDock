@@ -1,255 +1,33 @@
-# =============================================================================
-# 沙箱基础镜像 Dockerfile
-# =============================================================================
-# 用途：为代码执行沙箱提供安全隔离的 Python 数据分析环境
-# 
-# 安全特性：
-# - 以非 root 用户运行（Requirement 6.1）
-# - 支持只读根文件系统（Requirement 6.3）
-# - 仅允许写入指定目录：/workspace, /tmp, /data, /output
-#
-# 预装库（Requirement 4.7）：
-# - pandas, numpy, matplotlib, seaborn
-# - scipy, scikit-learn, plotly
-# =============================================================================
+ARG BASE_IMAGE=code-executor-sandbox-base:latest
+FROM ${BASE_IMAGE}
 
-# ============================================
-# 构建阶段：安装 Python 依赖
-# ============================================
-FROM python:3.11-slim AS builder
-
-# 国内镜像开关：默认启用，海外构建请传 --build-arg USE_CHINA_MIRROR=0
 ARG USE_CHINA_MIRROR=1
 
-# 设置构建阶段环境变量
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# builder 阶段切换 apt 源（uv 安装某些含 C 扩展的包时可能需要编译工具）
-# Debian 12+ 使用 deb822 格式 /etc/apt/sources.list.d/debian.sources；
-# 旧版镜像 fallback 到 /etc/apt/sources.list
-RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
-            sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
-                /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
-        fi
-
-# pip / uv 国内索引（清华 TUNA，速度最稳）
 ENV PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple} \
     UV_INDEX_URL=${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple} \
-    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    PYTHONPATH=/opt/sandbox/deps
 
-WORKDIR /build
-
-# 创建 requirements 文件，包含数据分析和科研绘图常用库
-# 使用固定版本以确保构建可重复性
-RUN echo "pandas>=2.0.0,<3.0.0" > requirements.txt && \
-    echo "numpy>=1.24.0,<2.0.0" >> requirements.txt && \
-    echo "polars>=0.20.0,<1.0.0" >> requirements.txt && \
-    echo "matplotlib>=3.7.0,<4.0.0" >> requirements.txt && \
-    echo "seaborn>=0.12.0,<1.0.0" >> requirements.txt && \
-    echo "plotly>=5.14.0,<6.0.0" >> requirements.txt && \
-    echo "bokeh>=3.3.0,<4.0.0" >> requirements.txt && \
-    echo "altair>=5.2.0,<6.0.0" >> requirements.txt && \
-    echo "pyecharts>=2.0.0,<3.0.0" >> requirements.txt && \
-    echo "drawsvg>=2.0.0,<3.0.0" >> requirements.txt && \
-    echo "wqchartpy>=0.1.10" >> requirements.txt && \
-    echo "python-ternary>=1.0.8,<2.0.0" >> requirements.txt && \
-    echo "plotnine>=0.12.0,<1.0.0" >> requirements.txt && \
-    echo "matplotlib-venn>=0.11.0,<1.0.0" >> requirements.txt && \
-    echo "holoviews>=1.18.0,<2.0.0" >> requirements.txt && \
-    echo "wordcloud>=1.9.0,<2.0.0" >> requirements.txt && \
-    echo "squarify>=0.4.3,<1.0.0" >> requirements.txt && \
-    echo "pygal>=3.0.0,<4.0.0" >> requirements.txt && \
-    echo "palettable>=3.3.0,<4.0.0" >> requirements.txt && \
-    echo "cmocean>=3.0.0,<4.0.0" >> requirements.txt && \
-    echo "colorcet>=3.0.0,<4.0.0" >> requirements.txt && \
-    echo "SciencePlots>=2.1.0,<3.0.0" >> requirements.txt && \
-    echo "scipy>=1.10.0,<2.0.0" >> requirements.txt && \
-    echo "sympy>=1.12,<2.0.0" >> requirements.txt && \
-    echo "statsmodels>=0.14.0,<1.0.0" >> requirements.txt && \
-    echo "pingouin>=0.5.3,<1.0.0" >> requirements.txt && \
-    echo "scikit-learn>=1.2.0,<2.0.0" >> requirements.txt && \
-    echo "geopandas>=0.14.0,<1.0.0" >> requirements.txt && \
-    echo "folium>=0.15.0,<1.0.0" >> requirements.txt && \
-    echo "shapely>=2.0.0,<3.0.0" >> requirements.txt && \
-    echo "cartopy>=0.22.0,<1.0.0" >> requirements.txt && \
-    echo "contextily>=1.4.0,<2.0.0" >> requirements.txt && \
-    echo "networkx>=3.2.0,<4.0.0" >> requirements.txt && \
-    echo "pyvis>=0.3.0,<1.0.0" >> requirements.txt && \
-    echo "graphviz>=0.20.0,<1.0.0" >> requirements.txt && \
-    echo "pillow>=10.0.0,<12.0.0" >> requirements.txt && \
-    echo "opencv-python-headless>=4.8.0,<5.0.0" >> requirements.txt && \
-    echo "scikit-image>=0.22.0,<1.0.0" >> requirements.txt && \
-    echo "cairosvg>=2.7.0,<3.0.0" >> requirements.txt && \
-    echo "openpyxl>=3.1.0,<4.0.0" >> requirements.txt && \
-    echo "xlrd>=2.0.0,<3.0.0" >> requirements.txt && \
-    echo "xlsxwriter>=3.1.0,<4.0.0" >> requirements.txt && \
-    echo "pyarrow>=14.0.0,<16.0.0" >> requirements.txt && \
-    echo "python-docx>=1.1.0,<2.0.0" >> requirements.txt && \
-    echo "PyPDF2>=3.0.0,<4.0.0" >> requirements.txt && \
-    echo "ipython>=8.18.0,<9.0.0" >> requirements.txt && \
-    echo "ipywidgets>=8.1.0,<9.0.0" >> requirements.txt && \
-    echo "tabulate>=0.9.0,<1.0.0" >> requirements.txt && \
-    echo "tqdm>=4.66.0,<5.0.0" >> requirements.txt && \
-    echo "python-dateutil>=2.8.0,<3.0.0" >> requirements.txt && \
-    echo "pytz>=2023.3" >> requirements.txt && \
-    echo "pyyaml>=6.0.0,<7.0.0" >> requirements.txt && \
-    echo "adjustText>=0.8,<1.0.0" >> requirements.txt
-
-# 引入 uv 包管理器（替代 pip，构建速度提升 10-100 倍）
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-# 安装 Python 依赖到临时目录
-# 使用 uv 替代 pip 以获得极速的依赖解析和安装
-RUN uv pip install --no-cache-dir --target=/build/deps -r requirements.txt
-
-# 验证关键包是否安装成功
-RUN PYTHONPATH=/build/deps python -c "import drawsvg; print('✅ drawsvg installed:', drawsvg.__version__)" && \
-    PYTHONPATH=/build/deps python -c "import wqchartpy; print('✅ wqchartpy installed')" && \
-    PYTHONPATH=/build/deps python -c "import pandas; print('✅ pandas installed:', pandas.__version__)" && \
-    PYTHONPATH=/build/deps python -c "import matplotlib; print('✅ matplotlib installed:', matplotlib.__version__)"
-
-# ============================================
-# 最终镜像阶段
-# ============================================
-FROM python:3.11-slim
-
-# 镜像元数据
 LABEL maintainer="Code Executor Service" \
-      description="沙箱基础镜像 - 安全隔离的 Python 数据分析环境" \
-      version="1.0.0"
+      description="Layered sandbox app image" \
+      version="2.0.0"
 
-# 设置环境变量
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONIOENCODING=utf-8 \
-    PYTHONUTF8=1 \
-    # matplotlib 无头模式配置（用于服务器端渲染）
-    MPLBACKEND=Agg \
-    # Qt 无头模式（某些可视化库可能需要）
-    QT_QPA_PLATFORM=offscreen \
-    # matplotlib 配置目录（设置为可写目录）
-    MPLCONFIGDIR=/tmp/matplotlib \
-    # 设置 Python 路径以包含安装的依赖
-    PYTHONPATH=/opt/sandbox/deps \
-    # 工作目录环境变量
-    WORKSPACE_DIR=/workspace \
-    DATA_DIR=/data \
-    OUTPUT_DIR=/output \
-    # 设置 HOME 目录为可写目录（某些库需要写入 HOME）
-    HOME=/workspace \
-    # Kernel Server 端口（常驻执行进程）
-    KERNEL_PORT=9999
+WORKDIR /tmp/build
 
-# 国内镜像开关（与 builder 阶段保持一致；默认启用）
-ARG USE_CHINA_MIRROR=1
+COPY requirements.lock /tmp/build/requirements.lock
 
-# 配置国内镜像源加速 apt（Debian 12+ 默认使用 deb822 格式）
-# 海外部署请传 --build-arg USE_CHINA_MIRROR=0 关闭
-        RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
-            sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
-                /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
-        fi
+RUN uv pip install \
+    --python /usr/local/bin/python3.11 \
+    --no-cache-dir \
+    --target=/opt/sandbox/deps \
+    -r /tmp/build/requirements.lock
 
-# 安装系统依赖
-# 合并 RUN 命令以减少镜像层数，优化镜像大小
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # 字体支持（中文显示必需）
-    fonts-noto-cjk \
-    fonts-noto-cjk-extra \
-    fonts-wqy-microhei \
-    fonts-wqy-zenhei \
-    fonts-arphic-uming \
-    fonts-arphic-ukai \
-    fonts-liberation \
-    fontconfig \
-    # matplotlib 运行时依赖
-    libfreetype6 \
-    libpng16-16 \
-    # OpenCV 依赖（Debian Trixie 使用 libgl1 替代 libgl1-mesa-glx）
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    # geo-packages and other dependencies
-    libgdal-dev \
-    libgeos-dev \
-    libproj-dev \
-    # Graphviz 依赖
-    graphviz \
-    libgraphviz-dev \
-    # Cairo 依赖（cairosvg）
-    libcairo2 \
-    libcairo2-dev \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    # 编译依赖（某些包需要）
-    gcc \
-    g++ \
-    wget \
-    # 清理缓存以减小镜像大小
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean \
-    && rm -rf /var/cache/apt/archives/* \
-    && rm -rf /tmp/* /var/tmp/* \
-        # 下载 SimHei 字体（优先且仅从 Gitee 获取）
-        # 如果 Gitee 下载失败，不回退到 GitHub，构建继续但会记录警告
-        && mkdir -p /usr/share/fonts/truetype/simhei \
-        && ( \
-                 wget -q --tries=3 --timeout=20 -O /usr/share/fonts/truetype/simhei/SimHei.ttf \
-                     "https://gitee.com/mirrors_StellarCN/scp_zh/raw/master/fonts/SimHei.ttf" \
-                 || (echo '⚠️ SimHei 从 Gitee 下载失败，继续构建但未安装 SimHei' && rm -f /usr/share/fonts/truetype/simhei/SimHei.ttf) \
-             ) \
-    # 刷新字体缓存
-    && fc-cache -fv
-
-# 创建非 root 用户（Requirement 6.1：以非 root 用户身份运行）
-# 使用固定 UID/GID 以确保一致性和可预测性
-ARG USER_UID=1000
-ARG USER_GID=1000
-
-RUN groupadd --gid ${USER_GID} sandbox \
-    && useradd --uid ${USER_UID} --gid ${USER_GID} \
-       --shell /bin/bash \
-       --no-create-home \
-       sandbox
-
-# 创建应用依赖目录
-RUN mkdir -p /opt/sandbox/deps
-
-# 从构建阶段复制 Python 依赖
-COPY --from=builder /build/deps /opt/sandbox/deps
-
-# 复制 sandbox_runtime 预置运行时库
-# 这是重构后的核心库，包含环境初始化、图表捕获、表格输出等功能
 COPY sandbox_runtime /opt/sandbox/deps/sandbox_runtime
 
-# 创建可写目录（Requirement 6.3：只读根文件系统，仅允许写入指定目录）
-# /workspace - 代码执行的工作空间
-# /tmp       - 临时文件目录
-# /data      - 数据文件目录（用于上传的数据文件）
-# /output    - 输出文件目录（用于生成的图表和结果）
-RUN mkdir -p /workspace /data /output /tmp/matplotlib \
-    && chown -R sandbox:sandbox /workspace /data /output /tmp \
-    && chmod 755 /workspace /data /output \
-    && chmod 1777 /tmp
+RUN chmod -R 555 /opt/sandbox/deps && \
+    python3.11 -c "import pandas, numpy, matplotlib, seaborn, scipy, sklearn, pyarrow; print('OK')"
 
-# 设置依赖目录权限（只读）
-RUN chmod -R 555 /opt/sandbox/deps
-
-# 切换到非 root 用户
 USER sandbox
-
-# 设置工作目录
 WORKDIR /workspace
-
-# 暴露 Kernel Server 端口
 EXPOSE 9999
-
-# 容器启动时启动 Kernel Server（常驻代码执行进程）
-# 替代原来的 tail -f /dev/null 空等待模式
-# Kernel Server 保持 Python 命名空间常驻内存，
-# DataFrame 等变量在多次执行间保持不变，性能提升 10-50 倍
-CMD ["python", "-m", "sandbox_runtime.kernel_server"]
+CMD ["python3.11", "-m", "sandbox_runtime.kernel_server"]

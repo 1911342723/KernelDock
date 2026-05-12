@@ -13,6 +13,7 @@ Requirements:
 """
 
 import asyncio
+from collections.abc import AsyncIterator
 import logging
 import os
 import shutil
@@ -407,7 +408,7 @@ class SandboxManager:
             timeout = timeout_seconds or settings.timeout.session_idle_timeout
             
             # 创建工作空间目录
-            data_dir, output_dir = self._create_workspace_dirs(session_id)
+            data_dir, output_dir, data_dir_readonly = self._create_workspace_dirs(session_id)
             
             # 创建新容器（不使用预热容器池，因为有状态会话需要自定义配置）
             container_id = await self._create_container(
@@ -415,7 +416,8 @@ class SandboxManager:
                 resource_limits=resource_limits,
                 network_policy=network_policy,
                 data_dir=data_dir,
-                output_dir=output_dir
+                output_dir=output_dir,
+                data_dir_readonly=data_dir_readonly,
             )
             
             # 创建沙箱信息
@@ -466,7 +468,7 @@ class SandboxManager:
         except Exception as e:
             # 清理可能创建的资源
             logger.error(f"创建沙箱失败: {sandbox_id}, 错误: {e}")
-            await self._cleanup_sandbox_resources(sandbox_id)
+            await self._cleanup_sandbox_resources(session_id)
             
             if isinstance(e, (ContainerPoolExhaustedError, SandboxCreationError)):
                 raise
@@ -561,7 +563,7 @@ class SandboxManager:
             logger.warning(f"删除容器时出错: {container_id[:12]}, 错误: {e}")
         
         # 清理工作空间目录
-        await self._cleanup_sandbox_resources(sandbox_id)
+        await self._cleanup_sandbox_resources(session_id)
         
         logger.info(f"沙箱销毁完成: {sandbox_id}")
         return True
@@ -570,7 +572,9 @@ class SandboxManager:
         self,
         sandbox_id: str,
         code: str,
-        timeout: int = 300
+        timeout: int = 300,
+        pre_load_parquet: Optional[Dict[str, str]] = None,
+        bootstrap_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         在沙箱中执行代码
@@ -578,17 +582,26 @@ class SandboxManager:
         使用 CodeExecutor 在 Docker 容器内执行代码，支持图表和表格捕获。
         
         Requirements:
-        - 4.1: 在 Sandbox_Container 内执行代码并返回结果
+        context_id: Optional[str] = None,
         - 4.2: 代码执行超过配置的超时时间时终止执行并返回超时错误
         - 4.3: 捕获代码执行的标准输出、标准错误和返回值
         - 4.4: 自动捕获 matplotlib 生成的图表并转换为 SVG 格式
         - 4.5: 支持 display_table 函数捕获 DataFrame 数据
         - 4.6: 代码执行产生异常时返回完整的异常堆栈信息
-        
+
+        multi-table-analysis (executor_protocol_multitable.md):
+        - ``pre_load_parquet``: ``{TableRef: base64(parquet bytes)}``，调用方
+                context_id=context_id,
+        - ``bootstrap_source``: DataLoaderBootstrap Python 源码，透传到
+          ``CodeExecutor.execute_in_container``，由 kernel 在 user code
+          之前 exec。
+
         Args:
             sandbox_id: 沙箱 ID
             code: Python 代码
             timeout: 执行超时（秒）
+            pre_load_parquet: TableRef → base64 parquet 字节（可选）
+            bootstrap_source: DataLoaderBootstrap 源码（可选）
             
         Returns:
             执行结果字典，包含:
@@ -643,7 +656,26 @@ class SandboxManager:
                 "error": f"CodeValidationError: {issues_msg}",
                 "execution_time_ms": 0
             }
-        
+
+        # multi-table-analysis: 把 pre_load_parquet 落盘到容器 /data/<ref>.parquet
+        if pre_load_parquet:
+            if not bootstrap_source:
+                return {
+                    "success": False,
+                    "output": "",
+                    "stdout": "",
+                    "stderr": "pre_load_parquet provided without bootstrap_source",
+                    "charts": [],
+                    "tables": [],
+                    "images": [],
+                    "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
+                    "execution_time_ms": 0,
+                }
+            await self._ensure_materialized_pre_load_parquet(
+                container_id,
+                pre_load_parquet,
+            )
+
         executor = CodeExecutor(self._docker_client)
         try:
             result = await executor.execute_in_container(
@@ -651,33 +683,290 @@ class SandboxManager:
                 code=code,
                 data_dir=container_data_dir,
                 output_dir=container_output_dir,
-                timeout=timeout
+                timeout=timeout,
+                bootstrap_source=bootstrap_source,
             )
             return result
         finally:
             # 注意：不关闭 executor，因为它使用的是共享的 docker_client
             pass
 
+    async def stream_execute_code(
+        self,
+        sandbox_id: str,
+        code: str,
+        timeout: int = 300,
+        pre_load_parquet: Optional[Dict[str, str]] = None,
+        bootstrap_source: Optional[str] = None,
+        context_id: Optional[str] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """流式执行代码，返回 kernel 发出的事件流。"""
+        from ..executor import CodeExecutor
+        from .code_validator import validate_code
+
+        async with self._lock:
+            record = self._sandboxes.get(sandbox_id)
+            if record is None:
+                raise SandboxNotFoundError(sandbox_id=sandbox_id)
+            record.info.last_activity = datetime.now()
+
+        validation_result = validate_code(code)
+        if not validation_result.is_valid:
+            issues_msg = "; ".join(
+                f"Line {i.line}: {i.message}" for i in validation_result.issues
+            )
+            yield {
+                "type": "error",
+                "error": f"CodeValidationError: {issues_msg}",
+            }
+            yield {
+                "type": "done",
+                "success": False,
+                "error": f"CodeValidationError: {issues_msg}",
+                "execution_time_ms": 0,
+                "context_id": context_id,
+                "timed_out": False,
+            }
+            return
+
+        if pre_load_parquet:
+            if not bootstrap_source:
+                yield {
+                    "type": "error",
+                    "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
+                }
+                yield {
+                    "type": "done",
+                    "success": False,
+                    "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
+                    "execution_time_ms": 0,
+                    "context_id": context_id,
+                    "timed_out": False,
+                }
+                return
+            await self._ensure_materialized_pre_load_parquet(
+                record.info.container_id,
+                pre_load_parquet,
+            )
+
+        executor = CodeExecutor(self._docker_client)
+        async for event in executor.stream_in_container(
+            container_id=record.info.container_id,
+            code=code,
+            timeout=timeout,
+            bootstrap_source=bootstrap_source,
+            context_id=context_id,
+        ):
+            yield event
+
+    async def _materialize_pre_load_parquet(
+        self,
+        container_id: str,
+        pre_load_parquet: Dict[str, str],
+    ) -> None:
+        """把 ``{ref: base64}`` 解码后写入容器 ``/data/<ref>.parquet``。
+
+        见 executor_protocol_multitable.md §"Server-Side Handler Requirements"：
+        - 解码失败 → 抛 ``InternalError``，调用方负责包装成错误响应；
+        - 目录需要先确保存在（容器启动时已经 mkdir /data，但无状态 temp
+          容器场景下也一并处理）；
+        - 优先走 put_archive，失败回退到分块 echo+base64（复用
+          :meth:`_inject_data_files` 的同款策略）。
+        """
+        import base64 as _b64
+        import tarfile
+        import io
+
+        if not pre_load_parquet:
+            return
+
+        # 先确保 /data 目录存在（对无状态临时容器而言）
+        try:
+            await self._docker_client.exec_command(
+                container_id,
+                "mkdir -p /data",
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+        # 收集解码结果（把失败放在落盘之前抛出，避免只写了一部分）
+        decoded: Dict[str, bytes] = {}
+        for ref, b64_content in pre_load_parquet.items():
+            safe_ref = os.path.basename(ref)
+            if not safe_ref or safe_ref != ref:
+                raise InternalError(
+                    message=f"pre_load_parquet: invalid table_ref {ref!r}"
+                )
+            try:
+                decoded[safe_ref] = _b64.b64decode(b64_content)
+            except Exception as e:
+                raise InternalError(
+                    message=f"pre_load_parquet: base64 decode failed for {ref}: {e}"
+                )
+
+        # [Phase 1 诊断] 写盘前：打印 container_id、ref 列表、字节数总和
+        sorted_refs = sorted(decoded.keys())
+        total_bytes = sum(len(raw) for raw in decoded.values())
+        short_cid = container_id[:12] if container_id else ""
+        logger.info(
+            f"[SandboxManager.materialize_pre_load] pre-write "
+            f"container={short_cid} refs={sorted_refs} "
+            f"total_bytes={total_bytes}"
+        )
+
+        async def _log_data_dir_listing() -> None:
+            """[Phase 1 诊断] 写盘后：通过 docker exec ls /data 读取目录内容。"""
+            try:
+                ls_result = await self._docker_client.exec_command(
+                    container_id,
+                    "ls /data",
+                    timeout=5,
+                )
+                # 把多行输出压成单行便于 grep
+                data_listing = ls_result.stdout.strip().replace("\n", " ")
+                logger.info(
+                    f"[SandboxManager.materialize_pre_load] post-write "
+                    f"container={short_cid} /data={data_listing!r}"
+                )
+            except Exception as err:
+                logger.info(
+                    f"[SandboxManager.materialize_pre_load] post-write "
+                    f"container={short_cid} /data=<exec_failed: {err}>"
+                )
+
+        # 优先 put_archive
+        try:
+            tar_stream = io.BytesIO()
+            with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+                for ref, raw in decoded.items():
+                    info = tarfile.TarInfo(name=f"{ref}.parquet")
+                    info.size = len(raw)
+                    info.mode = 0o644
+                    info.uid = 1000
+                    info.gid = 1000
+                    tar.addfile(info, io.BytesIO(raw))
+            tar_stream.seek(0)
+            await self._docker_client.put_archive(
+                container_id, "/data", tar_stream.read()
+            )
+            logger.debug(
+                f"[pre_load_parquet] put_archive 写入 {len(decoded)} 张表 -> {short_cid}"
+            )
+            await _log_data_dir_listing()
+            return
+        except Exception as e:
+            logger.debug(f"[pre_load_parquet] put_archive 失败，回退 echo+base64: {e}")
+
+        # 回退 echo+base64
+        RAW_CHUNK_SIZE = 24576
+        for ref, raw in decoded.items():
+            target = f"/data/{ref}.parquet"
+            for i in range(0, len(raw), RAW_CHUNK_SIZE):
+                chunk = raw[i:i + RAW_CHUNK_SIZE]
+                b64_chunk = _b64.b64encode(chunk).decode("ascii")
+                op = ">" if i == 0 else ">>"
+                result = await self._docker_client.exec_command(
+                    container_id,
+                    f"echo '{b64_chunk}' | base64 -d {op} {target}",
+                    timeout=30,
+                )
+                if result.exit_code != 0:
+                    raise InternalError(
+                        message=(
+                            f"[pre_load_parquet] chunk write failed ref={ref} "
+                            f"chunk={i // RAW_CHUNK_SIZE} stderr={result.stderr}"
+                        )
+                    )
+        await _log_data_dir_listing()
+
+    async def _data_dir_has_materialized_parquet(self, container_id: str) -> bool:
+        """Return whether the container currently exposes any parquet under /data."""
+        try:
+            result = await self._docker_client.exec_command(
+                container_id,
+                "sh -lc \"ls /data/*.parquet >/dev/null 2>/dev/null\"",
+                timeout=5,
+            )
+        except Exception as err:
+            logger.info(
+                "[SandboxManager.pre_load_health] container=%s parquet_check_failed=%r",
+                container_id[:12],
+                err,
+            )
+            return False
+
+        has_parquet = result.exit_code == 0
+        logger.info(
+            "[SandboxManager.pre_load_health] container=%s has_parquet=%s",
+            container_id[:12],
+            has_parquet,
+        )
+        return has_parquet
+
+    async def _ensure_materialized_pre_load_parquet(
+        self,
+        container_id: str,
+        pre_load_parquet: Dict[str, str],
+    ) -> None:
+        """Check /data first and only re-materialize parquet when the container is empty."""
+        if not pre_load_parquet:
+            return
+
+        if await self._data_dir_has_materialized_parquet(container_id):
+            return
+
+        logger.info(
+            "[SandboxManager.pre_load_health] container=%s /data empty -> materialize_pre_load_parquet",
+            container_id[:12],
+        )
+        await self._materialize_pre_load_parquet(container_id, pre_load_parquet)
+
     async def execute_stateless(
         self,
         code: str,
         data_files: Optional[Dict[str, str]] = None,
         timeout: int = 30,
+        pre_load_parquet: Optional[Dict[str, str]] = None,
+        bootstrap_source: Optional[str] = None,
+        context_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         无状态执行：借容器 → 注入数据 → 执行代码 → 清理 → 归还容器。
 
         容器不与任何 session 绑定，执行完毕立即归还池，实现快速轮转。
 
+        multi-table-analysis: 支持 ``pre_load_parquet`` + ``bootstrap_source``
+        契约（见 executor_protocol_multitable.md）。若两者都提供，沙箱会：
+        1) 先把 ``{ref: base64(parquet)}`` 落到容器 ``/data/<ref>.parquet``；
+        2) 在 user code *之前* exec ``bootstrap_source``，由它按 TableRef
+                context_id=context_id,
+
         Args:
             code: Python 代码
             data_files: 数据文件字典 {filename: base64_content}
             timeout: 执行超时（秒）
+            pre_load_parquet: {TableRef: base64(parquet bytes)}（可选，多表分析）
+            bootstrap_source: DataLoaderBootstrap 源码（可选，多表分析）
+            context_id: 内核上下文 ID（可选）
 
         Returns:
             执行结果字典（与 execute_code 格式一致）
         """
         from ..executor import CodeExecutor
+
+        if pre_load_parquet and not bootstrap_source:
+            return {
+                "success": False,
+                "output": "",
+                "stdout": "",
+                "stderr": "pre_load_parquet provided without bootstrap_source",
+                "charts": [],
+                "tables": [],
+                "images": [],
+                "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
+                "execution_time_ms": 0,
+            }
 
         if not self._container_pool:
             raise InternalError(message="容器池未初始化")
@@ -688,7 +977,12 @@ class SandboxManager:
             # 池空，回退到创建临时容器
             logger.warning("容器池为空，创建临时容器执行")
             return await self._execute_stateless_with_temp_container(
-                code, data_files, timeout
+                code,
+                data_files,
+                timeout,
+                pre_load_parquet=pre_load_parquet,
+                bootstrap_source=bootstrap_source,
+                context_id=context_id,
             )
 
         container_id = pooled.container_id
@@ -696,6 +990,11 @@ class SandboxManager:
             # 2. 注入数据文件
             if data_files:
                 await self._inject_data_files(container_id, data_files)
+            if pre_load_parquet:
+                await self._ensure_materialized_pre_load_parquet(
+                    container_id,
+                    pre_load_parquet,
+                )
 
             # 3. 执行代码
             executor = CodeExecutor(self._docker_client)
@@ -705,6 +1004,8 @@ class SandboxManager:
                 data_dir="/data",
                 output_dir="/output",
                 timeout=timeout,
+                bootstrap_source=bootstrap_source,
+                context_id=context_id,
             )
 
             cleanup_ok = (
@@ -727,6 +1028,9 @@ class SandboxManager:
         code: str,
         data_files: Optional[Dict[str, str]],
         timeout: int,
+        pre_load_parquet: Optional[Dict[str, str]] = None,
+        bootstrap_source: Optional[str] = None,
+        context_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """池空时创建临时容器执行，执行完销毁。"""
         from ..executor import CodeExecutor
@@ -745,7 +1049,6 @@ class SandboxManager:
 
         container_info = await self._docker_client.create_container(
             image=self._docker_image,
-            command=None,  # 使用 Dockerfile CMD（kernel_server）
             detach=True,
             network_mode="none",
             tmpfs=tmpfs_config,
@@ -758,6 +1061,11 @@ class SandboxManager:
         try:
             if data_files:
                 await self._inject_data_files(container_id, data_files)
+            if pre_load_parquet:
+                await self._ensure_materialized_pre_load_parquet(
+                    container_id,
+                    pre_load_parquet,
+                )
 
             executor = CodeExecutor(self._docker_client)
             result = await executor.execute_in_container(
@@ -766,6 +1074,8 @@ class SandboxManager:
                 data_dir="/data",
                 output_dir="/output",
                 timeout=timeout,
+                bootstrap_source=bootstrap_source,
+                context_id=context_id,
             )
             return result
         finally:
@@ -1102,25 +1412,30 @@ class SandboxManager:
         """
         return f"sandbox-{uuid.uuid4().hex[:12]}"
     
-    def _create_workspace_dirs(self, sandbox_id: str) -> tuple[str, str]:
+    def _create_workspace_dirs(self, session_id: str) -> tuple[str, str, bool]:
         """
         创建沙箱工作空间目录
         
         Args:
-            sandbox_id: 沙箱 ID
+            session_id: 会话 ID
             
         Returns:
-            (data_dir, output_dir) 元组
+            (data_dir, output_dir, data_dir_readonly) 元组
         """
-        workspace_dir = os.path.join(self._workspace_base, sandbox_id)
-        data_dir = os.path.join(workspace_dir, "data")
+        workspace_dir = os.path.join(self._workspace_base, session_id)
         output_dir = os.path.join(workspace_dir, "output")
+        shared_data_root = (settings.shared_data_root or "").strip()
+        data_dir_readonly = bool(shared_data_root)
+        if shared_data_root:
+            data_dir = os.path.join(shared_data_root, session_id)
+        else:
+            data_dir = os.path.join(workspace_dir, "data")
         
         os.makedirs(data_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
         
         logger.debug(f"创建工作空间目录: {workspace_dir}")
-        return data_dir, output_dir
+        return data_dir, output_dir, data_dir_readonly
     
     async def _create_container(
         self,
@@ -1128,7 +1443,8 @@ class SandboxManager:
         resource_limits: ResourceLimits,
         network_policy: NetworkPolicy,
         data_dir: str,
-        output_dir: str
+        output_dir: str,
+        data_dir_readonly: bool = False,
     ) -> str:
         """
         创建沙箱容器
@@ -1161,7 +1477,7 @@ class SandboxManager:
         
         # 卷挂载配置
         volumes = {
-            data_dir: {"bind": "/data", "mode": "rw"},
+            data_dir: {"bind": "/data", "mode": "ro" if data_dir_readonly else "rw"},
             output_dir: {"bind": "/output", "mode": "rw"},
         }
         
@@ -1269,7 +1585,7 @@ class SandboxManager:
             logger.warning(f"更新沙箱状态失败: {record.info.sandbox_id}, 错误: {e}")
             record.info.state = SandboxState.ERROR
     
-    async def _cleanup_sandbox_resources(self, sandbox_id: str) -> None:
+    async def _cleanup_sandbox_resources(self, session_id: str) -> None:
         """
         清理沙箱资源
         
@@ -1278,9 +1594,9 @@ class SandboxManager:
         Requirements 5.6: 沙箱销毁时清理所有关联的文件
         
         Args:
-            sandbox_id: 沙箱 ID
+            session_id: 会话 ID
         """
-        workspace_dir = os.path.join(self._workspace_base, sandbox_id)
+        workspace_dir = os.path.join(self._workspace_base, session_id)
         
         if os.path.exists(workspace_dir):
             try:

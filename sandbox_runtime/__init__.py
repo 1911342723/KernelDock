@@ -18,7 +18,7 @@ Sandbox Runtime - 代码执行沙箱的预置运行时库
 from .setup import setup, get_data_dir, get_output_dir
 from .charts import save_figure, capture_current_figures
 from .tables import display_table, save_table
-from .data_loader import load_data_files, get_loaded_tables
+from .data_loader import load_parquet_tables, get_loaded_tables, get_default_dataframe
 
 __all__ = [
     'setup',
@@ -28,8 +28,9 @@ __all__ = [
     'capture_current_figures',
     'display_table',
     'save_table',
-    'load_data_files',
+    'load_parquet_tables',
     'get_loaded_tables',
+    'get_default_dataframe',
 ]
 
 __version__ = '1.0.0'

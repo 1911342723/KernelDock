@@ -1,0 +1,71 @@
+ARG UV_VERSION=0.7.3
+FROM python:3.11-slim
+
+ARG UV_VERSION
+ARG USE_CHINA_MIRROR=1
+ARG PYTHON_VERSION=3.11
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONIOENCODING=utf-8 \
+    PYTHONUTF8=1 \
+    PATH=/root/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+
+RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
+        if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+            sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+        fi; \
+    fi
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    passwd \
+    build-essential \
+    gcc \
+    g++ \
+    graphviz \
+    libcairo2 \
+    libfreetype6 \
+    libgdal-dev \
+    libgeos-dev \
+    libglib2.0-0 \
+    libgl1 \
+    libpng16-16 \
+    libproj-dev \
+    fonts-noto-cjk \
+    fonts-wqy-microhei \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
+        pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn "uv==${UV_VERSION}"; \
+    else \
+        pip install --no-cache-dir "uv==${UV_VERSION}"; \
+    fi && \
+    python --version && uv --version
+
+RUN groupadd --gid ${USER_GID} sandbox && \
+    useradd --uid ${USER_UID} --gid ${USER_GID} --shell /bin/bash --create-home sandbox && \
+    mkdir -p /opt/sandbox/deps /workspace /data /output /tmp/matplotlib && \
+    chown -R sandbox:sandbox /opt/sandbox /workspace /data /output /tmp/matplotlib && \
+    chmod 755 /workspace /data /output && \
+    chmod 1777 /tmp
+
+ENV MPLBACKEND=Agg \
+    QT_QPA_PLATFORM=offscreen \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    HOME=/workspace \
+    DATA_DIR=/data \
+    OUTPUT_DIR=/output \
+    WORKSPACE_DIR=/workspace \
+    KERNEL_PORT=9999
+
+WORKDIR /workspace

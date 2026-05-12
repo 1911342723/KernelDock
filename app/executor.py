@@ -24,7 +24,7 @@ import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, AsyncIterator, Dict, List, Optional, TypedDict
 
 from .config import settings
 from .exceptions import ExecutionTimeoutError, InternalError, SandboxNotFoundError
@@ -57,70 +57,59 @@ class MultiTableContext(TypedDict):
 
 
 def generate_variable_name(filename: str) -> str:
+    """Deprecated (multi-table-analysis). 保留空实现避免外部 import 失败。
+
+    新管线由 backend ``WorkbookParser`` 固化 TableRef，沙箱不再需要从
+    文件名推导变量名。
     """
-    根据文件名生成有效的 Python 变量名
-    
-    Args:
-        filename: 文件名
-        
-    Returns:
-        有效的 Python 变量名
-    """
-    name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
-    var_name = re.sub(r'[^a-zA-Z0-9_]', '_', name_without_ext)
-    var_name = re.sub(r'_+', '_', var_name).strip('_')
-    if not var_name:
-        var_name = 'df_data'
-    if var_name[0].isdigit():
-        var_name = 'df_' + var_name
-    return var_name
+    return "df_data"
 
 
-# 数据加载代码模板
-# Requirements 4.7: 预加载数据分析常用库（pandas、numpy、matplotlib、seaborn）
-# Requirements 4.4: 自动捕获 matplotlib 生成的图表并转换为 SVG 格式
-# Requirements 4.5: 支持 display_table 函数捕获 DataFrame 数据
+# ==================== 数据加载代码模板 ====================
 #
-# 重构说明：原有 150+ 行的代码模板已迁移到 sandbox_runtime 包中预安装
-# 现在只需导入并初始化即可，大幅减少每次执行的代码解析开销
+# multi-table-analysis (design §5.3)：
+# - 默认模板不再扫描 `/data`；数据加载由 backend 渲染的 ``bootstrap_source``
+#   负责（execute 请求中以显式字段下发）。
+# - 本模板仅做：环境变量 / matplotlib 初始化 / 常用库导入 / SVG & Table
+#   辅助函数注入 + 空 df 占位。
+# - 如果调用方没传 ``bootstrap_source``，执行的是"无数据多表上下文"；
+#   用户代码仍然可以自己 ``pd.read_parquet`` 或直接写 pandas 逻辑。
+#
+# Requirements 4.7 / 4.4 / 4.5 仍然成立（库预加载 / 图表 / 表格捕获）。
 DATA_LOADER_TEMPLATE = '''
 # ===== Sandbox Runtime Initialization =====
 import os
 os.environ['DATA_DIR'] = r'{data_dir}'
 os.environ['OUTPUT_DIR'] = r'{output_dir}'
 
-# 初始化沙箱运行时（配置编码、matplotlib、seaborn）
 from sandbox_runtime import setup
 setup()
 
-# 强制 print 刷新缓冲区
 import functools
 print = functools.partial(print, flush=True)
 
-# 加载数据文件到全局命名空间
-from sandbox_runtime.data_loader import load_data_files, get_default_dataframe
-load_data_files(globals_dict=globals())
-df = get_default_dataframe()
-
-# 导入常用数据分析库
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# 导入便捷函数
 from sandbox_runtime.charts import save_figure, capture_current_figures
 from sandbox_runtime.tables import display_table, save_table
 
+# 多表分析：默认空上下文；如果本请求带了 bootstrap_source，
+# _execute_via_docker_exec 会在用户代码 *之前* 插入 bootstrap_source
+# 来覆盖这些占位，按 TableRef 从 parquet 加载数据并绑定 df。
+df = pd.DataFrame()
+_loaded_tables = {{}}
+TABLE_REFS = []
+FOCUS_REF = None
+
 DATA_DIR = r'{data_dir}'
 OUTPUT_DIR = r'{output_dir}'
-
-# ===== User Code Start =====
 '''
 
 
 # 备份代码模板：检查未捕获的图表
-# 重构说明：使用 sandbox_runtime 的 capture_current_figures 函数
 BACKUP_CHART_CAPTURE_CODE = '''
 
 # ===== 备份：检查未捕获的图表 =====
@@ -224,6 +213,8 @@ class CodeExecutor:
         output_dir: str,
         timeout: int = DEFAULT_TIMEOUT,
         user: Optional[str] = None,
+        bootstrap_source: Optional[str] = None,
+        context_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         在指定容器内执行代码（Kernel-first 策略）
@@ -241,7 +232,13 @@ class CodeExecutor:
         - 4.4: 自动捕获 matplotlib 图表
         - 4.5: 支持 display_table 函数
         - 4.6: 返回完整的异常堆栈信息
-        
+
+        multi-table-analysis (design §5.3 / executor_protocol_multitable.md):
+        - ``bootstrap_source``: 由 backend 渲染的 DataLoaderBootstrap
+          Python 源码。如果提供，沙箱会在 user code 之前 exec 该源码，
+          由它负责按 TableRef 从 ``<data_dir>/<ref>.parquet`` 加载数据并
+          绑定 ``df`` / ``_loaded_tables``。
+
         Args:
             container_id: Docker 容器 ID
             code: 要执行的 Python 代码
@@ -249,6 +246,7 @@ class CodeExecutor:
             output_dir: 输出目录路径（容器内路径）
             timeout: 执行超时时间（秒）
             user: 执行用户（可选）
+            bootstrap_source: DataLoaderBootstrap 源码（可选；见上）
             
         Returns:
             执行结果字典
@@ -260,7 +258,13 @@ class CodeExecutor:
         
         # --- 优先方案：通过 Kernel Server 执行（变量常驻内存） ---
         try:
-            result = await self._execute_via_kernel(container_id, code, timeout)
+            result = await self._execute_via_kernel(
+                container_id,
+                code,
+                timeout,
+                bootstrap_source=bootstrap_source,
+                context_id=context_id,
+            )
             if result is not None:
                 return result
         except Exception as e:
@@ -268,7 +272,8 @@ class CodeExecutor:
         
         # --- 回退方案：docker exec 执行（原有模式） ---
         return await self._execute_via_docker_exec(
-            container_id, code, data_dir, output_dir, timeout, user, start_time
+            container_id, code, data_dir, output_dir, timeout, user, start_time,
+            bootstrap_source=bootstrap_source,
         )
 
     async def _execute_via_kernel(
@@ -276,6 +281,8 @@ class CodeExecutor:
         container_id: str,
         code: str,
         timeout: int = DEFAULT_TIMEOUT,
+        bootstrap_source: Optional[str] = None,
+        context_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         通过 docker exec 中继连接容器内的 Kernel Server 执行代码。
@@ -299,6 +306,10 @@ class CodeExecutor:
             "code": code,
             "timeout": timeout,
         }
+        if bootstrap_source:
+            request["bootstrap_source"] = bootstrap_source
+        if context_id:
+            request["context_id"] = context_id
         request_bytes = _json.dumps(request, ensure_ascii=False).encode("utf-8")
 
         # 写入请求文件到容器
@@ -341,6 +352,16 @@ class CodeExecutor:
         if result.stdout:
             try:
                 response = _json.loads(result.stdout)
+                # 防御：旧版 kernel 不认识 bootstrap_source 参数时会返回
+                # TypeError，此时应回退到 docker exec 让 bootstrap 拼进脚本。
+                if (
+                    not response.get("success", True)
+                    and "unexpected keyword argument" in (response.get("error") or "")
+                ):
+                    logger.warning(
+                        "Kernel 版本不兼容（缺少 bootstrap_source 支持），回退到 docker exec"
+                    )
+                    return None
                 logger.debug(
                     f"Kernel 执行完成: success={response.get('success')}, "
                     f"耗时={response.get('execution_time_ms', 0)}ms"
@@ -351,6 +372,75 @@ class CodeExecutor:
 
         return None
 
+    async def stream_in_container(
+        self,
+        container_id: str,
+        code: str,
+        timeout: int = DEFAULT_TIMEOUT,
+        bootstrap_source: Optional[str] = None,
+        context_id: Optional[str] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """通过 kernel relay stream 在容器内流式执行代码。"""
+        import json as _json
+
+        request = {
+            "action": "execute_stream",
+            "code": code,
+            "timeout": timeout,
+        }
+        if bootstrap_source:
+            request["bootstrap_source"] = bootstrap_source
+        if context_id:
+            request["context_id"] = context_id
+        request_bytes = _json.dumps(request, ensure_ascii=False).encode("utf-8")
+
+        req_id = uuid.uuid4().hex[:8]
+        req_path = f"/tmp/_kreq_{req_id}.json"
+        try:
+            await self._put_file_to_container(container_id, req_path, request_bytes)
+        except Exception as e:
+            logger.debug(f"Kernel stream 请求文件写入失败: {e}")
+            yield {"type": "error", "error": f"Kernel stream request write failed: {e}"}
+            return
+
+        buffer = ""
+        try:
+            async for stdout_chunk, stderr_chunk in self._docker_client.exec_command_stream(
+                container_id,
+                f"python -m sandbox_runtime.kernel_relay_stream {req_path}",
+            ):
+                if stderr_chunk:
+                    yield {
+                        "type": "stderr",
+                        "text": stderr_chunk.decode("utf-8", errors="replace"),
+                    }
+
+                if not stdout_chunk:
+                    continue
+
+                buffer += stdout_chunk.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        yield _json.loads(line)
+                    except _json.JSONDecodeError:
+                        yield {"type": "stdout", "text": line + "\n"}
+
+            if buffer.strip():
+                try:
+                    yield _json.loads(buffer)
+                except _json.JSONDecodeError:
+                    yield {"type": "stdout", "text": buffer}
+        finally:
+            try:
+                await self._docker_client.exec_command(
+                    container_id, f"rm -f {req_path}", timeout=5
+                )
+            except Exception:
+                pass
+
     async def _execute_via_docker_exec(
         self,
         container_id: str,
@@ -360,18 +450,42 @@ class CodeExecutor:
         timeout: int,
         user: Optional[str],
         start_time: float,
+        bootstrap_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         通过 docker exec 执行代码（原有模式，作为 Kernel 的回退方案）
+
+        multi-table-analysis: 若 ``bootstrap_source`` 非空，将它插入到
+        ``DATA_LOADER_TEMPLATE`` 和 user code 之间，由它负责按 TableRef
+        加载 parquet 并覆盖空 ``df`` 占位。
         """
         import time
         
         try:
             # 构建完整的执行代码
-            full_code = DATA_LOADER_TEMPLATE.format(
-                data_dir=data_dir.replace('\\', '\\\\'),
-                output_dir=output_dir.replace('\\', '\\\\')
-            ) + code + BACKUP_CHART_CAPTURE_CODE
+            bootstrap_block = ""
+            if bootstrap_source:
+                bootstrap_block = (
+                    "\n# ===== DataLoaderBootstrap (backend) =====\n"
+                    + bootstrap_source
+                    + "\n"
+                )
+                logger.info(
+                    f"[docker_exec] bootstrap_source injected: {len(bootstrap_source)} chars"
+                )
+            else:
+                logger.info("[docker_exec] no bootstrap_source")
+
+            full_code = (
+                DATA_LOADER_TEMPLATE.format(
+                    data_dir=data_dir.replace('\\', '\\\\'),
+                    output_dir=output_dir.replace('\\', '\\\\'),
+                )
+                + bootstrap_block
+                + "\n# ===== User Code Start =====\n"
+                + code
+                + BACKUP_CHART_CAPTURE_CODE
+            )
             
             # 生成临时脚本文件名
             script_name = f"exec_{uuid.uuid4().hex[:8]}.py"
@@ -585,12 +699,16 @@ async def execute_code_in_workspace(
     docker_client: Optional[DockerClient] = None,
     on_stdout: Optional[Any] = None,
     on_stderr: Optional[Any] = None,
+    bootstrap_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     在工作空间中执行代码（兼容性函数）
     
     如果提供了 container_id，则使用 Docker exec 执行；
     否则回退到本地 subprocess 执行（用于测试或无 Docker 环境）。
+
+    multi-table-analysis: ``bootstrap_source`` 会透传给底层执行路径，由
+    它在 user code 之前 exec，按 TableRef 加载 parquet。
     
     Args:
         code: 要执行的 Python 代码
@@ -600,6 +718,7 @@ async def execute_code_in_workspace(
         timeout: 执行超时时间（秒）
         container_id: Docker 容器 ID（可选）
         docker_client: Docker 客户端实例（可选）
+        bootstrap_source: DataLoaderBootstrap 源码（可选）
         
     Returns:
         执行结果字典
@@ -616,7 +735,8 @@ async def execute_code_in_workspace(
                 code=code,
                 data_dir=data_dir,
                 output_dir=output_dir,
-                timeout=timeout
+                timeout=timeout,
+                bootstrap_source=bootstrap_source,
             )
         finally:
             await executor.close()
@@ -629,7 +749,8 @@ async def execute_code_in_workspace(
             output_dir=output_dir,
             timeout=timeout,
             on_stdout=on_stdout,
-            on_stderr=on_stderr
+            on_stderr=on_stderr,
+            bootstrap_source=bootstrap_source,
         )
 
 
@@ -641,12 +762,16 @@ async def _execute_code_subprocess(
     timeout: int = DEFAULT_TIMEOUT,
     on_stdout: Optional[Any] = None,
     on_stderr: Optional[Any] = None,
+    bootstrap_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     使用 subprocess 在本地执行代码（回退方案）
     
     用于测试或无 Docker 环境时的代码执行。
     已重构为使用 asyncio.create_subprocess_exec 实现非阻塞和流式输出。
+
+    multi-table-analysis: ``bootstrap_source`` 会被插入到
+    ``DATA_LOADER_TEMPLATE`` 和 user code 之间。
     
     Args:
         code: 要执行的 Python 代码
@@ -656,6 +781,7 @@ async def _execute_code_subprocess(
         timeout: 执行超时时间（秒）
         on_stdout: 标准输出回调函数
         on_stderr: 标准错误回调函数
+        bootstrap_source: DataLoaderBootstrap 源码（可选）
         
     Returns:
         执行结果字典
@@ -666,11 +792,25 @@ async def _execute_code_subprocess(
     
     logger.info(f"[SUBPROCESS] 开始执行代码: workspace={workspace_dir}, data_dir={data_dir}")
     start_time = time.monotonic()
-    
-    full_code = DATA_LOADER_TEMPLATE.format(
-        data_dir=data_dir.replace('\\', '\\\\'),
-        output_dir=output_dir.replace('\\', '\\\\')
-    ) + code + BACKUP_CHART_CAPTURE_CODE
+
+    bootstrap_block = ""
+    if bootstrap_source:
+        bootstrap_block = (
+            "\n# ===== DataLoaderBootstrap (backend) =====\n"
+            + bootstrap_source
+            + "\n"
+        )
+
+    full_code = (
+        DATA_LOADER_TEMPLATE.format(
+            data_dir=data_dir.replace('\\', '\\\\'),
+            output_dir=output_dir.replace('\\', '\\\\'),
+        )
+        + bootstrap_block
+        + "\n# ===== User Code Start =====\n"
+        + code
+        + BACKUP_CHART_CAPTURE_CODE
+    )
     
     logger.info(f"[SUBPROCESS] 完整代码长度: {len(full_code)} 字符")
     
@@ -1003,78 +1143,22 @@ class StatelessSession:
             return {"success": False, "error": str(e)}
     
     def get_table_schemas(self) -> List[TableSchema]:
+        """Deprecated (multi-table-analysis — executor_protocol_multitable.md).
+
+        新管线把 schema 计算迁到 backend ``SandboxContextBuilder``；
+        沙箱不再扫描 ``data_dir`` 解析 CSV/Excel。返回空列表保持 REST
+        endpoint 不炸，client 侧已下线。
         """
-        获取所有数据表的模式信息
-        
-        Returns:
-            表格模式列表
-        """
-        schemas = []
-        if not os.path.exists(self.data_dir):
-            return schemas
-        
-        import pandas as pd
-        data_files = [f for f in os.listdir(self.data_dir) if f.endswith(('.csv', '.xlsx', '.xls'))]
-        
-        for filename in data_files:
-            file_path = os.path.join(self.data_dir, filename)
-            try:
-                if filename.endswith('.csv'):
-                    for encoding in ['utf-8', 'gbk', 'gb2312', 'latin1']:
-                        try:
-                            df = pd.read_csv(file_path, encoding=encoding)
-                            break
-                        except UnicodeDecodeError:
-                            continue
-                    else:
-                        df = pd.read_csv(file_path, encoding='utf-8', errors='ignore')
-                else:
-                    df = pd.read_excel(file_path)
-                
-                var_name = generate_variable_name(filename)
-                sample_values = {}
-                for col in df.columns:
-                    non_null = df[col].dropna().head(3)
-                    sample_values[col] = [str(v) for v in non_null.tolist()]
-                
-                schemas.append({
-                    "name": filename,
-                    "variable_name": var_name,
-                    "columns": list(df.columns),
-                    "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
-                    "row_count": len(df),
-                    "sample_values": sample_values
-                })
-            except Exception:
-                pass
-        
-        return schemas
-    
+        return []
+
     def get_multi_table_context(self) -> MultiTableContext:
-        """
-        获取多表上下文信息
-        
-        Returns:
-            多表上下文字典
-        """
-        schemas = self.get_table_schemas()
-        total_rows = sum(s["row_count"] for s in schemas)
-        
-        column_to_tables: Dict[str, List[str]] = {}
-        for schema in schemas:
-            for col in schema["columns"]:
-                if col not in column_to_tables:
-                    column_to_tables[col] = []
-                column_to_tables[col].append(schema["name"])
-        
-        common_columns = {col: tables for col, tables in column_to_tables.items() if len(tables) > 1}
-        
+        """Deprecated — 参见 :meth:`get_table_schemas`。"""
         return {
-            "tables": schemas,
-            "table_count": len(schemas),
-            "total_rows": total_rows,
-            "common_columns": common_columns,
-            "suggested_joins": []
+            "tables": [],
+            "table_count": 0,
+            "total_rows": 0,
+            "common_columns": {},
+            "suggested_joins": [],
         }
     
     async def execute_code(
@@ -1083,16 +1167,22 @@ class StatelessSession:
         timeout: int = DEFAULT_TIMEOUT,
         on_stdout: Optional[Any] = None,
         on_stderr: Optional[Any] = None,
+        bootstrap_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         执行代码
         
         如果设置了 container_id，则使用 Docker exec 执行；
         否则使用本地 subprocess 执行。
-        
+
+        multi-table-analysis: ``bootstrap_source`` 透传给底层执行路径。
+
         Args:
             code: 要执行的 Python 代码
             timeout: 执行超时时间（秒）
+            on_stdout: 标准输出回调函数
+            on_stderr: 标准错误回调函数
+            bootstrap_source: DataLoaderBootstrap 源码（可选）
             
         Returns:
             执行结果字典
@@ -1111,7 +1201,8 @@ class StatelessSession:
                 code=code,
                 data_dir=container_data_dir,
                 output_dir=container_output_dir,
-                timeout=timeout
+                timeout=timeout,
+                bootstrap_source=bootstrap_source,
             )
         else:
             # 使用本地 subprocess 执行
@@ -1122,7 +1213,8 @@ class StatelessSession:
                 output_dir=self.output_dir,
                 timeout=timeout,
                 on_stdout=on_stdout,
-                on_stderr=on_stderr
+                on_stderr=on_stderr,
+                bootstrap_source=bootstrap_source,
             )
     
     def cleanup(self):

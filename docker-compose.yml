@@ -12,7 +12,7 @@ services:
     # (non-root + read-only rootfs + network=none + optional gVisor).
     user: root
     ports:
-      - "8080:8080"
+      - "9527:8080"
     volumes:
       # 持久化 workspace 数据
       - executor_workspace:/workspace
@@ -22,12 +22,12 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKSPACE_DIR=/workspace
       # ---- 沙箱镜像（Dockerfile.sandbox 构建的镜像） ----
-      - SANDBOX_DOCKER_IMAGE=code-executor-sandbox:latest
+      - SANDBOX_DOCKER_IMAGE=${SANDBOX_DOCKER_IMAGE:-code-executor-sandbox:v2.0.0}
       
       # ============ 资源限制配置（针对4C8G服务器优化） ============
       # 每个沙箱的资源限制
       - SANDBOX_RESOURCE__DEFAULT_CPU=1.0              # 每个沙箱最多占 1核
-      - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=256        # 每个沙箱 256MB（提高并发能力）
+      - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=512        # 每个沙箱 512MB（256太小，kernel启动就OOM）
       - SANDBOX_RESOURCE__DEFAULT_DISK_MB=1024         # 每个沙箱 1GB 磁盘
       - SANDBOX_RESOURCE__MAX_CPU=2.0                  # 最大允许 2核
       - SANDBOX_RESOURCE__MAX_MEMORY_MB=2048           # 最大允许 2GB
@@ -35,13 +35,13 @@ services:
       # ============ 并发控制配置 ============
       # Semaphore limit should match pool_size so every warm container can
       # serve a request concurrently (each kernel_server is single-threaded).
-      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=6     # = pool_size
+      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=4     # = pool_size
       - SANDBOX_QUEUE__INITIAL_AVG_EXECUTION_TIME=5.0
       - SANDBOX_QUEUE__QUEUE_TIMEOUT=300
       
       # ============ 容器池配置 ============
-      - SANDBOX_POOL__POOL_SIZE=6                      # 预热容器数量（6 * 256MB = 1.5GB）
-      - SANDBOX_POOL__MAX_CONCURRENT_SANDBOXES=20      # 最大并发沙箱数（20 * 256MB = 5GB）
+      - SANDBOX_POOL__POOL_SIZE=4                      # 预热容器数量（4 * 512MB = 2GB）
+      - SANDBOX_POOL__MAX_CONCURRENT_SANDBOXES=10      # 最大并发沙箱数
       - SANDBOX_POOL__CONTAINER_MAX_AGE_SECONDS=3600   # 容器最大存活 1小时
       - SANDBOX_POOL__HEALTH_CHECK_INTERVAL=60         # 健康检查间隔 1分钟
       
