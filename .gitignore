@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment
+.env
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Local artifacts
+.benchmarks/
+htmlcov/
+coverage.xml
+build-base.log
+build-sandbox.log
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
