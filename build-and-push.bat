@@ -3,7 +3,7 @@ REM 构建并推送 Docker 镜像 (Windows)
 
 setlocal
 
-set IMAGE_NAME=code-executor-service
+set IMAGE_NAME=kerneldock
 set VERSION=%1
 if "%VERSION%"=="" set VERSION=latest
 

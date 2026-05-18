@@ -4,7 +4,7 @@
 set -e
 
 # 配置
-IMAGE_NAME="code-executor-service"
+IMAGE_NAME="kerneldock"
 VERSION="${1:-latest}"
 REGISTRY="${DOCKER_REGISTRY:-}"  # 可选：docker.io/username 或私有仓库地址
 

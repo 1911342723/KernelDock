@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-BASE_IMAGE="${BASE_IMAGE:-code-executor-sandbox-base:latest}"
-APP_IMAGE="${APP_IMAGE:-code-executor-sandbox:v2.0.0}"
+BASE_IMAGE="${BASE_IMAGE:-kerneldock-sandbox-base:latest}"
+APP_IMAGE="${APP_IMAGE:-kerneldock-sandbox:v2.0.0}"
 USE_CHINA_MIRROR="${USE_CHINA_MIRROR:-1}"
 MAX_APP_IMAGE_MB="${MAX_APP_IMAGE_MB:-3072}"
 

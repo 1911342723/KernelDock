@@ -1,10 +1,10 @@
 services:
-  code-executor:
+  kerneldock:
     build:
       context: .
       dockerfile: Dockerfile
-    image: code-executor:latest
-    container_name: code-executor
+    image: kerneldock:latest
+    container_name: kerneldock
     # Gateway needs Docker socket access to manage sandbox containers.
     # Production recommendation: use rootless Docker or a Docker socket
     # proxy (e.g. tecnativa/docker-socket-proxy) to limit API surface.
@@ -22,7 +22,7 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKSPACE_DIR=/workspace
       # ---- 沙箱镜像（Dockerfile.sandbox 构建的镜像） ----
-      - SANDBOX_DOCKER_IMAGE=${SANDBOX_DOCKER_IMAGE:-code-executor-sandbox:v2.0.0}
+      - SANDBOX_DOCKER_IMAGE=${SANDBOX_DOCKER_IMAGE:-kerneldock-sandbox:v2.0.0}
       
       # ============ 资源限制配置（针对4C8G服务器优化） ============
       # 每个沙箱的资源限制

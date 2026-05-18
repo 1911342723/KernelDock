@@ -107,8 +107,8 @@ Linux / macOS：
 如果你在 Windows 上，建议使用 Git Bash / WSL；或者手动执行：
 
 ```bash
-docker build -f Dockerfile.base -t code-executor-sandbox-base:latest .
-docker build --build-arg BASE_IMAGE=code-executor-sandbox-base:latest -f Dockerfile.sandbox -t code-executor-sandbox:v2.0.0 .
+docker build -f Dockerfile.base -t kerneldock-sandbox-base:latest .
+docker build --build-arg BASE_IMAGE=kerneldock-sandbox-base:latest -f Dockerfile.sandbox -t kerneldock-sandbox:v2.0.0 .
 ```
 
 ### 2. 启动网关服务
@@ -122,7 +122,7 @@ docker compose up -d --build
 - 构建并启动 FastAPI 网关
 - 对外暴露 `9527` 端口
 - 通过 Docker socket 管理沙箱子容器
-- 使用 `code-executor-sandbox:v2.0.0` 作为默认沙箱镜像
+- 使用 `kerneldock-sandbox:v2.0.0` 作为默认沙箱镜像
 
 ### 3. 验证服务
 
@@ -265,7 +265,7 @@ curl -X POST http://localhost:9527/sessions/<session_id>/execute \
 
 | 变量 | 示例值 | 说明 |
 |------|--------|------|
-| `SANDBOX_DOCKER_IMAGE` | `code-executor-sandbox:v2.0.0` | 沙箱镜像标签 |
+| `SANDBOX_DOCKER_IMAGE` | `kerneldock-sandbox:v2.0.0` | 沙箱镜像标签 |
 | `SANDBOX_POOL__POOL_SIZE` | `4` | 预热容器数，决定常态并发能力 |
 | `SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS` | `4` | 执行队列并发上限，建议与池大小一致 |
 | `SANDBOX_RESOURCE__DEFAULT_CPU` | `1.0` | 单沙箱默认 CPU 限额 |
