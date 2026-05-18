@@ -8,7 +8,7 @@ IMAGE_NAME="code-executor-service"
 VERSION="${1:-latest}"
 REGISTRY="${DOCKER_REGISTRY:-}"  # 可选：docker.io/username 或私有仓库地址
 
-echo "=== Building Code Executor Service ==="
+echo "=== Building KernelDock ==="
 echo "Version: $VERSION"
 
 # 构建镜像

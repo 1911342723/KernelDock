@@ -1,6 +1,6 @@
 """
-Code Executor Service Client
-用于从后端调用 Code Executor 服务
+KernelDock Client
+用于从后端调用 KernelDock 服务
 """
 
 import httpx
@@ -24,7 +24,7 @@ class ExecutionResult:
 
 
 class CodeExecutorClient:
-    """Code Executor 服务客户端"""
+    """KernelDock 服务客户端"""
     
     def __init__(self, base_url: str = "http://localhost:8080", timeout: float = 600):
         self.base_url = base_url.rstrip('/')

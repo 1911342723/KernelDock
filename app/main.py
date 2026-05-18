@@ -1,5 +1,5 @@
 """
-Code Executor Service - FastAPI 服务
+KernelDock - FastAPI 服务
 
 提供代码执行 API，支持 Docker 沙箱隔离执行。
 集成沙箱管理器、会话存储和健康监控器。
@@ -153,7 +153,7 @@ async def lifespan(app: FastAPI):
     """
     global _sandbox_manager, _session_store, _health_monitor, _execution_queue, _context_manager
 
-    logger.info("Code Executor Service 启动中...")
+    logger.info("KernelDock 启动中...")
 
     # 初始化执行队列
     _execution_queue = ExecutionQueue(
@@ -209,11 +209,11 @@ async def lifespan(app: FastAPI):
             logger.error(f"沙箱管理器初始化失败，本地回退已禁用: {e}")
         _sandbox_manager = None
     
-    logger.info("Code Executor Service 启动完成")
+    logger.info("KernelDock 启动完成")
     
     yield
     
-    logger.info("Code Executor Service 关闭中...")
+    logger.info("KernelDock 关闭中...")
     
     # 停止健康监控
     if _health_monitor:
@@ -228,12 +228,12 @@ async def lifespan(app: FastAPI):
     for sid in list(session_manager.sessions.keys()):
         session_manager.delete_session(sid)
     
-    logger.info("Code Executor Service 已关闭")
+    logger.info("KernelDock 已关闭")
 
 
 app = FastAPI(
-    title="Code Executor Service",
-    description="Docker 沙箱 Python 代码执行服务，支持数据分析和可视化",
+    title="KernelDock",
+    description="面向 LLM 和数据分析场景的 Docker 沙箱 Python 执行服务",
     version="2.0.0",
     lifespan=lifespan
 )

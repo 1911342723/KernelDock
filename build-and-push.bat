@@ -7,7 +7,7 @@ set IMAGE_NAME=code-executor-service
 set VERSION=%1
 if "%VERSION%"=="" set VERSION=latest
 
-echo === Building Code Executor Service ===
+echo === Building KernelDock ===
 echo Version: %VERSION%
 
 REM 构建镜像

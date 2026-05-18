@@ -1,242 +1,335 @@
-# Code Executor Service
+# KernelDock
 
-给 LLM / AI Agent 用的 Python 代码沙箱。接收代码，在 Docker 容器里跑，返回 stdout、图表（自动拦截 matplotlib）、表格数据。不需要 Jupyter，不需要 E2B，一个 `docker compose up` 就完事。
+KernelDock 是一个面向 LLM、Agent 和数据分析应用的 Python 沙箱执行服务。它通过 FastAPI 暴露统一 API，把用户代码放进受限 Docker 容器执行，并返回结构化结果：`stdout`、`stderr`、图表、表格、图片、队列信息和执行元数据。
 
-核心卖点：
-- 容器内常驻 Kernel Server（TCP），变量在多轮对话间保持，不用每次重新 import
-- 底层劫持 matplotlib/seaborn 输出，LLM 不写 `savefig` 也能拿到图
-- 预热容器池，无状态请求从池里借容器执行完归还，冷启动零感知
-- AST 静态分析 + 只读 rootfs + network=none + 非 root 用户，四层隔离
+这个项目的目标不是做一个通用 Notebook 替代品，而是提供一个适合生产环境接入的“代码执行后端”：对上游 Agent 足够友好，对运维和安全团队也足够可控。
 
----
+## 为什么用它
 
-## 部署
+相比“直接起一个 Python 子进程”或“临时拉一个一次性容器”，这个项目的优势主要在四点：
 
-### Docker Compose（推荐）
+- 对 Agent 友好：返回的不是单一文本，而是图表、表格、文件和执行元信息，便于直接接入多模态或数据分析工作流。
+- 延迟更低：无状态请求可直接从预热容器池借容器执行，避免每次冷启动 Python 环境。
+- 会话能力更完整：有状态模式下容器内常驻 Kernel Server，多轮对话可以保留变量、已加载数据和执行上下文。
+- 安全边界更明确：基于 AST 校验、只读根文件系统、非 root、禁网、资源限制和可选 gVisor，默认就朝着“最小权限”收敛。
+
+## 核心特性
+
+- Stateless + Stateful 双模式执行
+- 预热容器池，降低短任务冷启动开销
+- 容器内常驻 Python Kernel，支持变量跨轮保持
+- 自动收集 matplotlib / seaborn 图表输出
+- 自动提取表格结果、图片结果和输出文件
+- 支持 REST、SSE 流式执行和 WebSocket 实时输出
+- 支持文件上传、共享数据目录、只读挂载和结果下载
+- 暴露 Prometheus 指标、健康检查、全局统计和队列状态
+- 支持容器级资源限制、会话超时和空闲回收
+
+## 适用场景
+
+- 给大模型提供“可执行 Python”能力
+- 数据分析 Copilot / BI Agent / Auto-EDA 工具
+- 需要图表和表格结构化返回的聊天式分析应用
+- 需要隔离执行用户代码的后端服务
+
+## 非目标
+
+- 不是多租户 Notebook 平台
+- 不是通用任意语言代码运行器
+- 不默认支持联网抓数场景，沙箱网络默认关闭
+
+## 架构概览
+
+![Architecture Overview](assets/architecture-overview.svg)
+
+执行路径有两种：
+
+- 无状态模式：从预热池借用容器，执行结束后清理 namespace 并归还池中。
+- 有状态模式：为 session 绑定沙箱，适合多轮分析、反复调试和跨请求复用变量。
+
+## 项目亮点
+
+### 1. 更适合 LLM 的结果结构
+
+很多代码执行服务只返回一段文本，本项目会把执行结果拆成机器更容易消费的结构：
+
+- `stdout` / `stderr`
+- `charts`
+- `tables`
+- `images`
+- `queue_info`
+- `sandbox_info`
+- `execution_info`
+
+这意味着上游 Agent 可以更稳定地决定“展示图表”“继续追问”“下载文件”“提示用户等待”，而不是从原始文本里猜。
+
+### 2. 冷启动影响更小
+
+沙箱容器池会提前预热容器。对于短时分析请求，这比“每次都新建容器”更接近在线服务的响应模型。
+
+### 3. 会话语义更自然
+
+有状态模式下，容器内 `kernel_server.py` 常驻，变量、导入模块和部分上下文可以跨轮保留，更贴近用户对“继续在刚才环境里分析”的直觉。
+
+### 4. 默认更保守的安全配置
+
+默认安全策略包括：
+
+- AST 静态校验
+- 容器内非 root 用户
+- 只读 root filesystem
+- 默认禁用网络
+- CPU / 内存 / 磁盘 / PIDs 限制
+- 会话空闲超时和最大生命周期控制
+- 可选启用 gVisor 进一步强化隔离
+
+## 快速开始
+
+### 前置要求
+
+- Docker Engine
+- Docker Compose
+- Linux 容器环境
+
+推荐机器配置：
+
+- 开发环境：4C8G
+- 生产环境：按并发和单沙箱资源限制放大
+
+### 1. 构建沙箱镜像
+
+Linux / macOS：
 
 ```bash
-# 1. 构建 base + app 双层镜像
 ./build.sh all
+```
 
-# 或分开构建
-./build.sh base
-./build.sh app
+如果你在 Windows 上，建议使用 Git Bash / WSL；或者手动执行：
 
-# 2. 启动服务
+```bash
+docker build -f Dockerfile.base -t code-executor-sandbox-base:latest .
+docker build --build-arg BASE_IMAGE=code-executor-sandbox-base:latest -f Dockerfile.sandbox -t code-executor-sandbox:v2.0.0 .
+```
+
+### 2. 启动网关服务
+
+```bash
 docker compose up -d --build
 ```
 
-双层镜像约定：
+仓库自带 `docker-compose.yml` 默认会：
 
-- `Dockerfile.base`：Ubuntu 24.04 + uv + Python 3.11 + 系统依赖
-- `Dockerfile.sandbox`：基于 base 镜像安装 `requirements.lock` 并复制 `sandbox_runtime`
+- 构建并启动 FastAPI 网关
+- 对外暴露 `9527` 端口
+- 通过 Docker socket 管理沙箱子容器
+- 使用 `code-executor-sandbox:v2.0.0` 作为默认沙箱镜像
 
-默认沙箱镜像标签是 `code-executor-sandbox:v2.0.0`，可通过环境变量 `SANDBOX_DOCKER_IMAGE` 覆盖。
+### 3. 验证服务
 
-服务跑在 `http://localhost:8080`。网关进程会自动拉起 6 个预热沙箱容器。
-
-### 关键配置
-
-在 `docker-compose.yml` 的 `environment` 里改。核心参数：
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SANDBOX_POOL__POOL_SIZE` | 6 | 预热容器数，决定并发上限 |
-| `SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS` | 6 | 信号量大小，应等于 pool_size |
-| `SANDBOX_RESOURCE__DEFAULT_MEMORY_MB` | 256 | 每个沙箱内存限制 |
-| `SANDBOX_RESOURCE__DEFAULT_CPU` | 1.0 | 每个沙箱 CPU 限制 |
-| `SANDBOX_TIMEOUT__EXECUTION_TIMEOUT` | 300 | 代码执行超时（秒） |
-| `CORS_ALLOWED_ORIGINS` | 空(=*) | 生产环境填实际域名，逗号分隔 |
-
-4C8G 机器建议 pool_size=6，每个沙箱 256MB，总占约 1.5GB。
-
-### 生产安全
-
-- 网关挂载了 Docker socket，生产环境建议用 [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) 限制 API 面
-- 沙箱容器已经做了 network=none + read-only rootfs + 非 root，想更硬可以换 gVisor 运行时
-- `CORS_ALLOWED_ORIGINS` 务必设置为实际域名
-
----
-
-## API
-
-### 系统
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/health` | 健康检查，返回池状态和资源占用 |
-| GET | `/metrics` | Prometheus 格式指标 |
-| GET | `/statistics` | 全局统计（沙箱数、执行数、队列状态） |
-| GET | `/queue/status` | 排队队列实时状态 |
-| POST | `/cleanup` | 清理过期会话 |
-
-### 无状态执行（推荐，用于 Agent 场景）
-
-**POST /execute**
-
-从容器池借一个容器，执行完归还。无需管理 session。
-
-```json
-// 请求
-{
-  "code": "import pandas as pd\ndf = pd.DataFrame({'a':[1,2,3]})\nprint(df.describe())",
-  "timeout": 30,
-  "data_files": {                    // 可选，base64 编码的数据文件
-    "sales.csv": "YSxiLGMKMSwyLDMK..."
-  }
-}
+```bash
+curl http://localhost:9527/health
 ```
 
+## 快速体验
+
+### 无状态执行
+
+```bash
+curl -X POST http://localhost:9527/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "import pandas as pd\nimport matplotlib.pyplot as plt\ndf = pd.DataFrame({\"x\":[1,2,3],\"y\":[2,4,8]})\nprint(df.describe())\ndf.plot(x=\"x\", y=\"y\")",
+    "timeout": 30
+  }'
+```
+
+示例响应字段：
+
 ```json
-// 响应
 {
   "success": true,
-  "output": "         a\ncount  3.0\nmean   2.0\n...",
   "stdout": "...",
   "stderr": "",
   "charts": [{"format": "svg", "base64": "PHN2Zy...", "path": null}],
-  "tables": [{"id": "...", "name": "...", "columns": [...], "data": [...]}],
+  "tables": [],
   "images": [],
-  "error": null,
-  "queue_info": {
-    "position_on_entry": 1,
-    "waited_seconds": 0.0,
-    "estimated_wait_seconds": 3.5,
-    "queue_depth": 0,
-    "executing_count": 1,
-    "max_concurrent": 6,
-    "avg_execution_time": 3.5,
-    "total_enqueued": 42,
-    "total_executed": 41
-  },
-  "sandbox_info": {
-    "mode": "stateless_pool_kernel",
-    "pool_available": 5,
-    "pool_total": 6
-  },
-  "execution_info": {
-    "execution_time_ms": 142,
-    "execution_path": "stateless_pool_kernel",
-    "code_size_bytes": 78,
-    "timeout_configured": 30,
-    "timed_out": false,
-    "chart_count": 1,
-    "table_count": 0,
-    "output_truncated": false,
-    "output_size_bytes": 320
-  }
+  "queue_info": {"position_on_entry": 0, "waited_seconds": 0.0},
+  "sandbox_info": {"mode": "stateless_pool_kernel", "pool_available": 3, "pool_total": 4},
+  "execution_info": {"execution_time_ms": 142, "chart_count": 1, "table_count": 0}
 }
 ```
 
 ### 有状态会话
 
-用于需要多轮交互、变量跨轮保持的场景。
+```bash
+curl -X POST http://localhost:9527/sessions -H "Content-Type: application/json" -d '{}'
+curl -X POST http://localhost:9527/sessions/<session_id>/execute \
+  -H "Content-Type: application/json" \
+  -d '{"code": "x = 42\nprint(x)"}'
+curl -X POST http://localhost:9527/sessions/<session_id>/execute \
+  -H "Content-Type: application/json" \
+  -d '{"code": "print(x + 1)"}'
+```
 
-| 方法 | 路径 | 说明 |
+第二次执行可以直接复用第一次留下的变量。
+
+## API 概览
+
+### 系统接口
+
+| Method | Path | Description |
 |------|------|------|
-| POST | `/sessions` | 创建会话。body: `{"session_id": "可选"}` |
-| GET | `/sessions/{id}` | 查看会话信息 |
-| DELETE | `/sessions/{id}` | 销毁会话和关联沙箱 |
-| POST | `/sessions/{id}/execute` | 执行代码。body: `{"code": "...", "timeout": 300}` |
-| POST | `/sessions/{id}/upload` | 上传文件（multipart/form-data） |
-| POST | `/sessions/{id}/load-data` | 加载 JSON 数据。body: `{"data_json": "...", "filename": "data.csv"}` |
-| GET | `/sessions/{id}/schemas` | 获取已加载表的 schema |
-| GET | `/sessions/{id}/context` | 多表上下文（列名、行数、可能的 join 列） |
-| GET | `/sessions/{id}/files` | 列出数据/输出文件 |
-| GET | `/sessions/{id}/files/{type}/{name}` | 下载指定文件 |
+| GET | `/health` | 健康检查，返回池状态和资源占用 |
+| GET | `/metrics` | Prometheus 指标导出 |
+| GET | `/statistics` | 全局统计信息 |
+| GET | `/queue/status` | 当前执行队列状态 |
+| POST | `/cleanup` | 清理过期会话 |
 
-`/sessions/{id}/execute` 的响应格式和 `/execute` 完全一致。
+### 执行接口
 
-### 沙箱管理
-
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |------|------|------|
-| GET | `/sandboxes` | 列出所有活跃沙箱，支持 `?state=running` 过滤 |
-| GET | `/sandboxes/{id}` | 查看单个沙箱详情 |
+| POST | `/execute` | 无状态执行，推荐用于 Agent 场景 |
+| POST | `/sessions` | 创建会话 |
+| GET | `/sessions/{id}` | 查询会话信息 |
+| DELETE | `/sessions/{id}` | 删除会话和关联沙箱 |
+| POST | `/sessions/{id}/execute` | 有状态执行 |
+| POST | `/v2/sessions/{id}/execute` | SSE 流式执行 |
+| WS | `/ws` | WebSocket 实时输出 |
+
+### 数据与文件接口
+
+| Method | Path | Description |
+|------|------|------|
+| POST | `/sessions/{id}/upload` | 上传文件 |
+| POST | `/sessions/{id}/load-data` | 加载 JSON 数据为文件 |
+| GET | `/sessions/{id}/schemas` | 获取表结构 |
+| GET | `/sessions/{id}/context` | 获取多表上下文 |
+| GET | `/sessions/{id}/contexts` | 列出上下文快照 |
+| POST | `/sessions/{id}/contexts` | 创建上下文快照 |
+| GET | `/sessions/{id}/files` | 列出文件 |
+| GET | `/sessions/{id}/files/{type}/{name}` | 下载文件 |
+
+### 沙箱管理接口
+
+| Method | Path | Description |
+|------|------|------|
+| GET | `/sandboxes` | 列出活跃沙箱 |
+| GET | `/sandboxes/{id}` | 查询沙箱详情 |
 | DELETE | `/sandboxes/{id}` | 强制销毁沙箱 |
-| GET | `/sandboxes/{id}/metrics` | 沙箱级资源用量（CPU/内存/网络） |
+| GET | `/sandboxes/{id}/metrics` | 查询沙箱资源指标 |
 
----
+## 响应结构
 
-## 响应结构说明
+执行 API 会在结果中补充三类对上游很有用的元数据：
 
-每次代码执行返回三块附加信息：
+### `queue_info`
 
-**queue_info** -- 排队状态
+反映请求是否排队、等了多久、当前系统拥塞程度。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| position_on_entry | int | 入队时排第几 |
-| waited_seconds | float | 实际等了多久 |
-| estimated_wait_seconds | float | 入队时的预估等待 |
-| queue_depth | int | 当前排队人数 |
-| executing_count | int | 正在执行的数量 |
-| max_concurrent | int | 并发上限 |
-| avg_execution_time | float | 滑动平均执行耗时（秒） |
+### `sandbox_info`
 
-**sandbox_info** -- 沙箱状态
+反映执行使用的沙箱模式、资源限制、容器池状态和沙箱实例信息。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| mode | string | 执行模式：`stateless_pool_kernel` / `sandbox_kernel` / `local_subprocess` |
-| sandbox_id | string? | 沙箱 ID（有状态模式下有值） |
-| container_id_short | string? | 容器 ID 前 12 位 |
-| state | string? | 沙箱状态（running/stopped/error） |
-| cpu_limit / memory_limit_mb | number? | 资源限制 |
-| pool_available / pool_total | int | 容器池可用数/总数 |
+### `execution_info`
 
-**execution_info** -- 执行细节
+反映执行耗时、超时配置、代码大小、图表数量、表格数量、输出是否被截断等。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| execution_time_ms | int | 执行耗时（毫秒） |
-| execution_path | string | 执行走的路径 |
-| code_size_bytes | int | 提交代码大小 |
-| timeout_configured | int | 配置的超时值 |
-| timed_out | bool | 是否超时 |
-| chart_count / table_count | int | 图表/表格数量 |
-| output_truncated | bool | 输出是否被截断（>100KB） |
+这三块信息对于前端状态提示、重试策略、限流决策和观测分析都很有价值。
 
----
+## 安全模型
 
-## 架构
+这是一个“面向不可信代码的隔离执行器”，但它不是无限安全的。推荐把它看作分层防护的一部分。
 
-```
-Client (LLM Agent)
-  |
-  v  HTTP
-+-------------------+
-| FastAPI Gateway    |  控制面：路由、队列、会话管理
-| (code-executor)    |
-+-------------------+
-  |
-  |  docker exec + TCP :9999
-  v
-+-------------------+     +-------------------+
-| Sandbox Container |     | Sandbox Container |  x N（预热池）
-| kernel_server.py  | ... | kernel_server.py  |
-| Python namespace  |     | Python namespace  |
-+-------------------+     +-------------------+
-```
+已实现的主要防护：
 
-- Gateway 通过 Docker socket 管理沙箱容器的生命周期
-- 每个沙箱内跑一个 `kernel_server.py`，监听 TCP 9999，保持 Python namespace 常驻
-- 代码执行通过 `docker exec` 运行中继脚本连接容器内 kernel，kernel 不可达时回退到 `docker exec python` 直接执行
-- 无状态模式从预热池借容器，执行完清理 namespace 后归还
+- 容器隔离
+- 非 root 用户运行
+- 只读根文件系统
+- 默认 `network=none`
+- AST 静态校验
+- 资源限制与超时控制
+- 可选 gVisor 运行时
 
----
+生产环境建议：
 
-## 测试
+- 使用专用 Docker 主机或节点池承载沙箱
+- 不要直接暴露 Docker socket，建议配合 docker-socket-proxy
+- 严格设置 `CORS_ALLOWED_ORIGINS`
+- 关闭本地回退模式：`SANDBOX_ALLOW_LOCAL_FALLBACK=false`
+- 根据业务规模调优容器池和资源限制
+
+## 关键配置
+
+下面的值以仓库自带 `docker-compose.yml` 为例：
+
+| 变量 | 示例值 | 说明 |
+|------|--------|------|
+| `SANDBOX_DOCKER_IMAGE` | `code-executor-sandbox:v2.0.0` | 沙箱镜像标签 |
+| `SANDBOX_POOL__POOL_SIZE` | `4` | 预热容器数，决定常态并发能力 |
+| `SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS` | `4` | 执行队列并发上限，建议与池大小一致 |
+| `SANDBOX_RESOURCE__DEFAULT_CPU` | `1.0` | 单沙箱默认 CPU 限额 |
+| `SANDBOX_RESOURCE__DEFAULT_MEMORY_MB` | `512` | 单沙箱默认内存限额 |
+| `SANDBOX_RESOURCE__DEFAULT_DISK_MB` | `1024` | 单沙箱默认磁盘限额 |
+| `SANDBOX_TIMEOUT__EXECUTION_TIMEOUT` | `300` | 单次执行超时 |
+| `SANDBOX_TIMEOUT__SESSION_IDLE_TIMEOUT` | `600` | 会话空闲超时 |
+| `CORS_ALLOWED_ORIGINS` | 空 | 开发环境可留空，生产务必收紧 |
+
+经验上，4C8G 机器可以从 `pool_size=4`、`memory=512MB` 起步，再根据真实负载调整。
+
+## 可观测性
+
+项目内置了面向运维的基础观测能力：
+
+- `/health`：服务健康、池状态、依赖状态
+- `/metrics`：Prometheus 指标导出
+- `/statistics`：聚合统计
+- `/queue/status`：执行队列状态
+- 沙箱级 CPU / 内存 / 磁盘 / 网络指标
+
+如果你要把它接进生产环境，这是比“能跑代码”更重要的一部分。
+
+## 开发与测试
 
 ```bash
-# 集成测试（验证所有响应字段）
-python tests/test_enriched_response.py --url http://localhost:8080
+# 运行测试
+pytest
+
+# 集成测试
+python tests/test_enriched_response.py --url http://localhost:9527
 
 # 并发压力测试
-python tests/stress_test.py --url http://localhost:8080 --scenario all -c 10 -n 30
+python tests/stress_test.py --url http://localhost:9527 --scenario all -c 10 -n 30
 ```
 
----
+仓库中还包含以下测试方向：
+
+- 容器池与会话管理
+- 流式执行与增强响应
+- 指标导出与管理接口
+- 数据上下文隔离
+- 卷挂载与共享数据目录
+- 冷启动与性能基线
+
+## 路线方向
+
+适合继续增强的方向包括：
+
+- 更细粒度的镜像分层与依赖裁剪
+- 更明确的 API 文档和 OpenAPI 示例
+- 更丰富的沙箱策略配置与审计日志
+- 更完善的 Helm / Kubernetes 部署方案
+
+## 贡献
+
+欢迎提交 Issue 和 PR。比较有价值的贡献方向：
+
+- 新的安全策略或隔离增强
+- 更稳定的图表 / 表格提取能力
+- 观测性、压测和基准测试改进
+- 文档、示例客户端和部署模板
+
+如果你计划做较大改动，建议先开一个 Issue 对齐设计和边界。
 
 ## License
 
