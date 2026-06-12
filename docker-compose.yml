@@ -1,67 +1,135 @@
 services:
+  # Docker API 代理：网关不再直挂 docker.sock，仅放行管理沙箱所需的最小 API 面。
+  # 即使网关被攻破，攻击者拿到的也只是受限的容器管理能力，而非宿主机 root。
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: kerneldock-socket-proxy
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # 沙箱生命周期管理所需的最小权限集
+      - CONTAINERS=1     # 容器 list/inspect/create
+      - POST=1           # 非 GET 写操作总开关
+      - ALLOW_START=1    # 容器 start（预热容器启动依赖）
+      - ALLOW_STOP=1     # 容器 stop（回收/销毁依赖）
+      - ALLOW_RESTARTS=0
+      - EXEC=1           # docker exec（kernel 中继依赖）
+      - IMAGES=1         # 镜像查询
+      - NETWORKS=1       # 沙箱网络管理
+      - VOLUMES=1        # 数据卷挂载
+      - INFO=1
+      - PING=1
+      - VERSION=1
+      # 明确禁用的高危面
+      - BUILD=0
+      - COMMIT=0
+      - SWARM=0
+      - SYSTEM=0
+    networks:
+      - kerneldock-internal
+
   kerneldock:
     build:
       context: .
       dockerfile: Dockerfile
     image: kerneldock:latest
     container_name: kerneldock
-    # Gateway needs Docker socket access to manage sandbox containers.
-    # Production recommendation: use rootless Docker or a Docker socket
-    # proxy (e.g. tecnativa/docker-socket-proxy) to limit API surface.
-    # Security isolation is enforced by sandbox containers themselves
-    # (non-root + read-only rootfs + network=none + optional gVisor).
-    user: root
+    # 通过 socket-proxy 访问 Docker API，网关以镜像内置的非 root 用户运行
+    depends_on:
+      - docker-socket-proxy
     ports:
       - "9527:8080"
     volumes:
-      # 持久化 workspace 数据
+      # 持久化 workspace 数据（含 SQLite 会话存储）
       - executor_workspace:/workspace
-      # 允许管理 docker 以启动沙箱子容器
-      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - kerneldock-internal
     environment:
       - PYTHONUNBUFFERED=1
       - WORKSPACE_DIR=/workspace
+      # ---- Docker API：走 socket-proxy，而非直挂 docker.sock ----
+      - SANDBOX_DOCKER_SOCKET=tcp://docker-socket-proxy:2375
+      # ---- kernel 通信方式 ----
+      # direct=TCP 直连（沙箱接 internal 网络无外网路由，单次执行省 ~600ms）
+      # relay=docker exec 中继（沙箱 network=none 物理禁网，最保守）
+      # direct 失败自动回退 relay，再回退 docker exec
+      - SANDBOX_KERNEL_TRANSPORT=${SANDBOX_KERNEL_TRANSPORT:-direct}
       # ---- 沙箱镜像（Dockerfile.sandbox 构建的镜像） ----
       - SANDBOX_DOCKER_IMAGE=${SANDBOX_DOCKER_IMAGE:-kerneldock-sandbox:v2.0.0}
-      
+
       # ============ 资源限制配置（针对4C8G服务器优化） ============
-      # 每个沙箱的资源限制
       - SANDBOX_RESOURCE__DEFAULT_CPU=1.0              # 每个沙箱最多占 1核
       - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=512        # 每个沙箱 512MB（256太小，kernel启动就OOM）
       - SANDBOX_RESOURCE__DEFAULT_DISK_MB=1024         # 每个沙箱 1GB 磁盘
       - SANDBOX_RESOURCE__MAX_CPU=2.0                  # 最大允许 2核
       - SANDBOX_RESOURCE__MAX_MEMORY_MB=2048           # 最大允许 2GB
-      
+
       # ============ 并发控制配置 ============
-      # Semaphore limit should match pool_size so every warm container can
-      # serve a request concurrently (each kernel_server is single-threaded).
-      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=4     # = pool_size
+      # 共享租约开启后无状态并发 = pool × shared_max_per_container（2×4=8 常态，
+      # 高峰扩容 4×4=16），队列闸门设 16。
+      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=16
       - SANDBOX_QUEUE__INITIAL_AVG_EXECUTION_TIME=5.0
       - SANDBOX_QUEUE__QUEUE_TIMEOUT=300
-      
-      # ============ 容器池配置 ============
-      - SANDBOX_POOL__POOL_SIZE=4                      # 预热容器数量（4 * 512MB = 2GB）
+
+      # ============ 容器池配置（弹性伸缩 + 共享租约） ============
+      - SANDBOX_POOL__POOL_SIZE=2                      # 常态预热容器数
+      - SANDBOX_POOL__MIN_POOL_SIZE=1                  # 空闲期缩容下限
+      - SANDBOX_POOL__MAX_POOL_SIZE=4                  # 高峰扩容上限
+      - SANDBOX_POOL__IDLE_SHRINK_SECONDS=600          # 连续空闲多久后缩容
+      # 共享租约：纯代码执行共享池容器并发 fork，密度 ×4。
+      # 注意：并发期间 /output、/tmp 跨请求可见，多租户部署请改为 false
+      - SANDBOX_POOL__SHARED_STATELESS=${SANDBOX_POOL__SHARED_STATELESS:-true}
+      - SANDBOX_POOL__SHARED_MAX_PER_CONTAINER=4       # 单容器并发 fork 上限
       - SANDBOX_POOL__MAX_CONCURRENT_SANDBOXES=10      # 最大并发沙箱数
       - SANDBOX_POOL__CONTAINER_MAX_AGE_SECONDS=3600   # 容器最大存活 1小时
       - SANDBOX_POOL__HEALTH_CHECK_INTERVAL=60         # 健康检查间隔 1分钟
-      
+
       # ============ 超时配置 ============
-      # 优化超时设置，提高资源利用率
       - SANDBOX_TIMEOUT__EXECUTION_TIMEOUT=300         # 代码执行超时 5分钟
-      - SANDBOX_TIMEOUT__SESSION_IDLE_TIMEOUT=600      # 会话空闲超时 10分钟（降低以提高并发）
+      - SANDBOX_TIMEOUT__SESSION_IDLE_TIMEOUT=600      # 会话空闲超时 10分钟
       - SANDBOX_TIMEOUT__SESSION_MAX_TIMEOUT=43200     # 会话最大时长 12小时
       - SANDBOX_TIMEOUT__SANDBOX_STARTUP_TIMEOUT=30    # 沙箱启动超时 30秒
-      
+
       # ============ Fire-and-Forget 配置（无状态短链接模式） ============
       - SANDBOX_FIRE_AND_FORGET__DEFAULT_TIMEOUT=30    # 默认执行超时 30秒
       - SANDBOX_FIRE_AND_FORGET__MAX_DATA_SIZE_MB=50   # 数据文件最大 50MB
       - SANDBOX_FIRE_AND_FORGET__CLEANUP_TIMEOUT=10    # 清理超时 10秒
-      
+
+      # ============ gVisor（可选强隔离） ============
+      # 宿主先运行 scripts/install_gvisor.sh 安装 runsc 并配置 Docker runtime，
+      # 然后设 SANDBOX_SECURITY__USE_GVISOR=true 即可，池容器/会话容器/临时容器全部生效。
+      # 代价：执行性能约有 10%~30% 损耗（syscall 密集型更明显）。
+      - SANDBOX_SECURITY__USE_GVISOR=${SANDBOX_SECURITY__USE_GVISOR:-false}
+      - SANDBOX_SECURITY__GVISOR_RUNTIME=${SANDBOX_SECURITY__GVISOR_RUNTIME:-runsc}
+
+      # ============ 限流 ============
+      # 每客户端（API Key 或 IP）每分钟请求上限；0 = 禁用
+      - SANDBOX_RATE_LIMIT_PER_MINUTE=${SANDBOX_RATE_LIMIT_PER_MINUTE:-0}
+
+      # ============ 出站网络策略 ============
+      # none=完全禁网（默认）；proxy=经白名单代理出站
+      # proxy 模式需同时:  docker compose --profile egress up -d
+      - SANDBOX_NETWORK__EGRESS_MODE=${SANDBOX_NETWORK__EGRESS_MODE:-none}
+      - SANDBOX_NETWORK__EGRESS_PROXY_URL=${SANDBOX_NETWORK__EGRESS_PROXY_URL:-http://kerneldock-egress-proxy:8888}
+
+      # ============ 分布式（可选） ============
+      # 配置 ROUTER_URL 后节点启动即向 router 自注册并周期心跳；
+      # NODE_ADVERTISE_URL 必须是 router 可达的本机地址（跨机部署填 LAN IP）
+      - ROUTER_URL=${ROUTER_URL:-}
+      - NODE_NAME=${NODE_NAME:-}
+      - NODE_ADVERTISE_URL=${NODE_ADVERTISE_URL:-}
+      - ROUTER_ADMIN_TOKEN=${ROUTER_ADMIN_TOKEN:-}
+      - ROUTER_HEARTBEAT_INTERVAL=${ROUTER_HEARTBEAT_INTERVAL:-10}
+
       # ============ 安全配置 ============
-      # CORS: 生产环境应设置为实际前端域名，逗号分隔
-      # 例如: CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
-      # 留空则使用 "*"（仅开发环境）
-      - CORS_ALLOWED_ORIGINS=
+      # API Key：逗号分隔多个；留空禁用认证（仅限开发环境！）
+      - SANDBOX_API_KEYS=${SANDBOX_API_KEYS:-}
+      # AST 静态校验模式: block / warn / off（默认 warn，安全边界在容器层）
+      - SANDBOX_VALIDATION_MODE=${SANDBOX_VALIDATION_MODE:-warn}
+      # CORS: 生产环境应设置为实际前端域名，逗号分隔；
+      # 留空时使用 "*" 且自动禁用凭证
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - SANDBOX_ALLOW_LOCAL_FALLBACK=false
     restart: unless-stopped
     healthcheck:
@@ -70,15 +138,35 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-    # 资源限制
     deploy:
       resources:
-        limits:     # 这是“硬上限” (网关进程最多能用多少)
-          cpus: '1'       # 网关最多吃掉 1 核 CPU
-          memory: 1G      # 网关最多使用 1GB 内存
-        reservations:    # 这是“软保证” (Docker保证给网关留出多少)
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
           cpus: '0.2'
           memory: 256M
+
+  # 出站白名单代理（可选）：docker compose --profile egress up -d
+  # 配合 SANDBOX_NETWORK__EGRESS_MODE=proxy 使用；
+  # 白名单在 egress/whitelist.txt 维护（域名正则，默认拒绝一切）。
+  # 网关启动时会自动把本容器接入沙箱互联网络（{network_name}-kernel，
+  # internal 无外路由）；本容器靠下面 kerneldock-internal 的腿出公网。
+  egress-proxy:
+    # 注：tinyproxy 官方无 ghcr 镜像（拉取 denied），用 Docker Hub 维护活跃的 vimagick 版
+    image: vimagick/tinyproxy:latest
+    container_name: kerneldock-egress-proxy
+    profiles: ["egress"]
+    restart: unless-stopped
+    volumes:
+      - ./egress/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./egress/whitelist.txt:/etc/tinyproxy/filter:ro
+    networks:
+      - kerneldock-internal
+
+networks:
+  kerneldock-internal:
+    driver: bridge
 
 volumes:
   executor_workspace:

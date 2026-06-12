@@ -4,14 +4,6 @@
 使用 Docker exec 在沙箱容器内执行 Python 代码，替代原有的 subprocess 方式。
 保持现有的图表捕获和表格捕获逻辑，实现超时控制和异常处理。
 
-Requirements:
-- 4.1: 在 Sandbox_Container 内执行代码并返回结果
-- 4.2: 代码执行超过配置的超时时间时终止执行并返回超时错误
-- 4.3: 捕获代码执行的标准输出、标准错误和返回值
-- 4.4: 自动捕获 matplotlib 生成的图表并转换为 SVG 格式
-- 4.5: 支持 display_table 函数捕获 DataFrame 数据
-- 4.6: 代码执行产生异常时返回完整的异常堆栈信息
-- 4.7: 预加载数据分析常用库（pandas、numpy、matplotlib、seaborn）
 """
 
 import asyncio
@@ -35,6 +27,12 @@ logger = logging.getLogger(__name__)
 # 默认配置
 DEFAULT_TIMEOUT = 300
 MAX_OUTPUT_LENGTH = 100000
+
+# 执行路径计数器（暴露到 /metrics，监控 kernel 静默回退）
+EXECUTION_PATH_COUNTERS: Dict[str, int] = {
+    "kernel_exec_total": 0,
+    "kernel_fallback_total": 0,
+}
 
 
 class TableSchema(TypedDict):
@@ -75,7 +73,6 @@ def generate_variable_name(filename: str) -> str:
 # - 如果调用方没传 ``bootstrap_source``，执行的是"无数据多表上下文"；
 #   用户代码仍然可以自己 ``pd.read_parquet`` 或直接写 pandas 逻辑。
 #
-# Requirements 4.7 / 4.4 / 4.5 仍然成立（库预加载 / 图表 / 表格捕获）。
 DATA_LOADER_TEMPLATE = '''
 # ===== Sandbox Runtime Initialization =====
 import os
@@ -126,15 +123,16 @@ class CodeExecutor:
     
     使用 Docker exec 在沙箱容器内执行 Python 代码。
     
-    Requirements:
-    - 4.1: 在 Sandbox_Container 内执行代码并返回结果
-    - 4.2: 代码执行超过配置的超时时间时终止执行并返回超时错误
-    - 4.3: 捕获代码执行的标准输出、标准错误和返回值
-    - 4.4: 自动捕获 matplotlib 生成的图表并转换为 SVG 格式
-    - 4.5: 支持 display_table 函数捕获 DataFrame 数据
-    - 4.6: 代码执行产生异常时返回完整的异常堆栈信息
     """
     
+    # 容器 IP 缓存（direct 直连用；容器销毁重建后连接失败即失效重查）
+    _ip_cache: Dict[str, str] = {}
+
+    @classmethod
+    def invalidate_ip_cache(cls, container_id: str) -> None:
+        """容器销毁时主动失效其 IP 缓存（避免下次直连先撞一次失败再被动清理）。"""
+        cls._ip_cache.pop(container_id, None)
+
     def __init__(self, docker_client: Optional[DockerClient] = None):
         """
         初始化代码执行器
@@ -144,6 +142,61 @@ class CodeExecutor:
         """
         self._docker_client = docker_client or DockerClient()
         logger.info("代码执行器初始化完成")
+
+    async def _kernel_rpc_direct(
+        self,
+        container_id: str,
+        request: Dict[str, Any],
+        timeout: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        TCP 直连容器内 Kernel Server 执行一次 RPC（4 字节长度头 + JSON）。
+
+        相比 relay（写文件 + docker exec 中继 + 清理 = 3 次 Docker API
+        往返 + 一次解释器冷启动，约 600~900ms），直连单次往返 <1ms。
+        失败返回 None（调用方回退 relay）。
+        """
+        import json as _json
+        import struct as _struct
+
+        ip = self._ip_cache.get(container_id)
+        if not ip:
+            ip = await self._docker_client.get_container_ip(container_id)
+            if not ip:
+                return None
+            self._ip_cache[container_id] = ip
+
+        payload = _json.dumps(request, ensure_ascii=False).encode("utf-8")
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, 9999), timeout=3
+            )
+        except Exception:
+            # IP 失效（容器重建）或网关不在直连网络内：清缓存并放弃直连
+            self._ip_cache.pop(container_id, None)
+            return None
+
+        try:
+            writer.write(_struct.pack(">I", len(payload)) + payload)
+            await writer.drain()
+
+            header = await asyncio.wait_for(
+                reader.readexactly(4), timeout=timeout + 20
+            )
+            (length,) = _struct.unpack(">I", header)
+            body = await asyncio.wait_for(
+                reader.readexactly(length), timeout=30
+            )
+            return _json.loads(body.decode("utf-8"))
+        except Exception as e:
+            logger.debug(f"kernel 直连 RPC 失败: {container_id[:12]}, {e}")
+            return None
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def _put_file_to_container(
         self,
@@ -215,6 +268,7 @@ class CodeExecutor:
         user: Optional[str] = None,
         bootstrap_source: Optional[str] = None,
         context_id: Optional[str] = None,
+        isolated: bool = False,
     ) -> Dict[str, Any]:
         """
         在指定容器内执行代码（Kernel-first 策略）
@@ -225,13 +279,6 @@ class CodeExecutor:
         
         如果 Kernel Server 不可达，自动回退到 docker exec 模式。
         
-        Requirements:
-        - 4.1: 在 Sandbox_Container 内执行代码并返回结果
-        - 4.2: 超时控制
-        - 4.3: 捕获标准输出、标准错误和返回值
-        - 4.4: 自动捕获 matplotlib 图表
-        - 4.5: 支持 display_table 函数
-        - 4.6: 返回完整的异常堆栈信息
 
         multi-table-analysis (design §5.3 / executor_protocol_multitable.md):
         - ``bootstrap_source``: 由 backend 渲染的 DataLoaderBootstrap
@@ -256,7 +303,29 @@ class CodeExecutor:
         
         logger.debug(f"在容器 {container_id[:12]} 中执行代码，超时: {timeout}s")
         
-        # --- 优先方案：通过 Kernel Server 执行（变量常驻内存） ---
+        # --- 最优方案：TCP 直连 Kernel Server（KERNEL_TRANSPORT=direct） ---
+        if settings.kernel_transport == "direct":
+            request = {
+                "action": "execute",
+                "code": code,
+                "timeout": timeout,
+            }
+            if bootstrap_source:
+                request["bootstrap_source"] = bootstrap_source
+            if context_id:
+                request["context_id"] = context_id
+            if isolated:
+                request["isolated"] = True
+            try:
+                result = await self._kernel_rpc_direct(container_id, request, timeout)
+                if result is not None:
+                    EXECUTION_PATH_COUNTERS["kernel_exec_total"] += 1
+                    return result
+                logger.debug("kernel 直连不可达，回退 relay")
+            except Exception as e:
+                logger.debug(f"kernel 直连异常，回退 relay: {e}")
+
+        # --- 次优方案：docker exec 中继连 Kernel Server ---
         try:
             result = await self._execute_via_kernel(
                 container_id,
@@ -264,13 +333,21 @@ class CodeExecutor:
                 timeout,
                 bootstrap_source=bootstrap_source,
                 context_id=context_id,
+                isolated=isolated,
             )
             if result is not None:
+                EXECUTION_PATH_COUNTERS["kernel_exec_total"] += 1
                 return result
         except Exception as e:
             logger.debug(f"Kernel 执行不可用，回退到 docker exec: {e}")
-        
+
         # --- 回退方案：docker exec 执行（原有模式） ---
+        # 回退意味着热启动失效（每次重新 import 全部库），必须可观测
+        EXECUTION_PATH_COUNTERS["kernel_fallback_total"] += 1
+        logger.warning(
+            f"Kernel 不可达，本次执行回退到 docker exec 慢路径: {container_id[:12]} "
+            f"(累计回退 {EXECUTION_PATH_COUNTERS['kernel_fallback_total']} 次)"
+        )
         return await self._execute_via_docker_exec(
             container_id, code, data_dir, output_dir, timeout, user, start_time,
             bootstrap_source=bootstrap_source,
@@ -283,6 +360,7 @@ class CodeExecutor:
         timeout: int = DEFAULT_TIMEOUT,
         bootstrap_source: Optional[str] = None,
         context_id: Optional[str] = None,
+        isolated: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         通过 docker exec 中继连接容器内的 Kernel Server 执行代码。
@@ -310,6 +388,8 @@ class CodeExecutor:
             request["bootstrap_source"] = bootstrap_source
         if context_id:
             request["context_id"] = context_id
+        if isolated:
+            request["isolated"] = True
         request_bytes = _json.dumps(request, ensure_ascii=False).encode("utf-8")
 
         # 写入请求文件到容器
@@ -603,11 +683,6 @@ class CodeExecutor:
         
         从执行输出中提取图表、表格等数据。
         
-        Requirements:
-        - 4.3: 捕获标准输出、标准错误和返回值
-        - 4.4: 自动捕获 matplotlib 图表
-        - 4.5: 支持 display_table 函数
-        - 4.6: 返回完整的异常堆栈信息
         
         Args:
             result: Docker exec 执行结果
@@ -623,7 +698,6 @@ class CodeExecutor:
         stdout_text = result.stdout
         stderr_text = result.stderr
         
-        # Requirements 4.4: 提取 SVG base64 图表
         charts = []
         svg_pattern = re.compile(r'SVG_BASE64_START:(.+?):SVG_BASE64_END', re.DOTALL)
         for match in svg_pattern.finditer(stdout_text):
@@ -638,7 +712,6 @@ class CodeExecutor:
         # 清理输出中的 SVG base64 标记
         clean_stdout = svg_pattern.sub('[图表已生成]', stdout_text)
         
-        # Requirements 4.5: 提取表格数据
         tables = []
         table_pattern = re.compile(r'TABLE_DATA_START:(.+?):TABLE_DATA_END', re.DOTALL)
         for match in table_pattern.finditer(stdout_text):
@@ -661,7 +734,6 @@ class CodeExecutor:
             output = output[:MAX_OUTPUT_LENGTH] + "\n... (输出已截断)"
         
         # 判断是否成功
-        # Requirements 4.6: 返回完整的异常堆栈信息
         has_error = result.exit_code != 0
         error_message = None
         if has_error:

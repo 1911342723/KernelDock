@@ -4,11 +4,6 @@
 管理预热容器池，提供快速的容器分配以加速沙箱创建。
 包括预热容器创建和维护、容器获取和释放、健康检查和自动补充等功能。
 
-Requirements:
-- 7.1: 维护可配置数量的预热容器（默认 3 个）
-- 7.2: 创建沙箱请求到达且有可用预热容器时，在 1 秒内分配预热容器
-- 7.3: 预热容器被分配后，异步创建新的预热容器补充池
-- 7.4: 定期检查预热容器的健康状态并替换不健康的容器
 """
 
 import asyncio
@@ -73,11 +68,6 @@ class ContainerPool:
     维护预热容器池，提供快速的容器分配。
     通过预热容器机制减少沙箱创建延迟，提升用户体验。
     
-    Requirements:
-    - 7.1: 维护可配置数量的预热容器（默认 3 个）
-    - 7.2: 在 1 秒内分配预热容器
-    - 7.3: 异步创建新的预热容器补充池
-    - 7.4: 定期检查预热容器健康状态并替换不健康的容器
     
     使用方式:
     ```python
@@ -98,6 +88,8 @@ class ContainerPool:
     # 容器标签，用于标识预热容器
     POOL_LABEL_KEY = "sandbox.pool"
     POOL_LABEL_VALUE = "warm"
+    # 实例标签：多实例共享 daemon 时区分归属，启动清理只清本实例
+    INSTANCE_LABEL_KEY = "sandbox.instance"
     
     def __init__(
         self,
@@ -106,21 +98,37 @@ class ContainerPool:
         max_container_age_seconds: int = 3600,
         health_check_interval_seconds: int = 60,
         image: Optional[str] = None,
-        container_config: Optional[Dict[str, Any]] = None
+        container_config: Optional[Dict[str, Any]] = None,
+        min_pool_size: Optional[int] = None,
+        max_pool_size: Optional[int] = None,
+        idle_shrink_seconds: int = 600,
     ):
         """
-        初始化容器池
-        
+        初始化容器池（支持弹性伸缩）
+
         Args:
             docker_client: Docker 客户端实例
-            pool_size: 预热容器数量（默认 3，Requirements 7.1）
+            pool_size: 常态预热容器数量（弹性伸缩基准）
             max_container_age_seconds: 容器最大存活时间（秒，默认 3600）
             health_check_interval_seconds: 健康检查间隔（秒，默认 60）
             image: Docker 镜像名称（可选，默认使用 settings 配置）
             container_config: 容器创建配置（可选）
+            min_pool_size: 空闲期缩容下限（默认 = pool_size，即不缩容）
+            max_pool_size: 高峰期扩容上限（默认 = pool_size，即不扩容）
+            idle_shrink_seconds: 连续空闲多少秒后缩容一档
         """
         self._docker_client = docker_client
         self._pool_size = pool_size
+        self._min_pool_size = min(
+            pool_size, min_pool_size if min_pool_size is not None else pool_size
+        )
+        self._max_pool_size = max(
+            pool_size, max_pool_size if max_pool_size is not None else pool_size
+        )
+        self._idle_shrink_seconds = idle_shrink_seconds
+        # 弹性目标值：常态 = pool_size；借空时上调，空闲时下调
+        self._target_size = pool_size
+        self._last_demand_at = time.monotonic()
         self._max_container_age_seconds = max_container_age_seconds
         self._health_check_interval_seconds = health_check_interval_seconds
         self._image = image or settings.docker_image
@@ -130,6 +138,8 @@ class ContainerPool:
         self._available_containers: List[PooledContainer] = []
         self._all_containers: Dict[str, PooledContainer] = {}
         self._leased_containers: Dict[str, PooledContainer] = {}
+        # 共享租约：container_id -> 当前并发 fork 数（容器仍留在 available 列表）
+        self._shared_inflight: Dict[str, int] = {}
         
         # 同步锁
         self._lock = asyncio.Lock()
@@ -172,7 +182,10 @@ class ContainerPool:
             max_container_age_seconds=settings.pool.container_max_age_seconds,
             health_check_interval_seconds=settings.pool.health_check_interval,
             image=settings.docker_image,
-            container_config=container_config
+            container_config=container_config,
+            min_pool_size=settings.pool.min_pool_size,
+            max_pool_size=settings.pool.max_pool_size,
+            idle_shrink_seconds=settings.pool.idle_shrink_seconds,
         )
     
     @property
@@ -220,12 +233,16 @@ class ContainerPool:
         """
         return {
             "pool_size": self._pool_size,
+            "target_size": self._target_size,
+            "min_pool_size": self._min_pool_size,
+            "max_pool_size": self._max_pool_size,
             "available_count": self.available_count,
             "total_count": self.total_count,
             "leased_count": self.leased_count,
             "total_acquired": self._total_acquired,
             "total_created": self._total_created,
             "total_removed": self._total_removed,
+            "shared_inflight": sum(self._shared_inflight.values()),
         }
     
     async def initialize(self) -> None:
@@ -306,9 +323,6 @@ class ContainerPool:
         如果池为空，返回 None。
         获取后会异步触发容器补充。
         
-        Requirements:
-        - 7.2: 在 1 秒内分配预热容器
-        - 7.3: 异步创建新的预热容器补充池
         
         Returns:
             PooledContainer 对象，如果池为空则返回 None
@@ -316,6 +330,7 @@ class ContainerPool:
         start_time = time.monotonic()
         
         async with self._lock:
+            self._last_demand_at = time.monotonic()
             # 查找可用的健康容器
             container = self._get_available_container()
             
@@ -335,7 +350,6 @@ class ContainerPool:
                 )
                 
                 # 异步触发容器补充
-                # Requirements 7.3: 异步创建新的预热容器补充池
                 asyncio.create_task(
                     self._trigger_replenish(),
                     name="container_pool_replenish"
@@ -343,6 +357,7 @@ class ContainerPool:
                 
                 return container
             
+            self._scale_up_on_miss()
             logger.warning("容器池为空，无可用预热容器")
             return None
     
@@ -358,6 +373,7 @@ class ContainerPool:
         start_time = time.monotonic()
 
         async with self._lock:
+            self._last_demand_at = time.monotonic()
             container = self._get_available_container()
 
             if container:
@@ -375,8 +391,59 @@ class ContainerPool:
 
                 return container
 
+            self._scale_up_on_miss()
             logger.warning("容器池为空，无可用预热容器（临时执行）")
             return None
+
+    async def acquire_shared(self, max_per_container: int) -> Optional[str]:
+        """
+        共享租约：返回一个可共享的池容器 ID 并将其并发计数 +1。
+
+        与 acquire/acquire_for_execution（独占借出）不同，容器仍留在池中，
+        多个 isolated 执行可在同一容器内并发 fork。
+        选择策略：在并发数 < max_per_container 的健康容器中取计数最小者
+        （负载均衡）。全部满载或池空时返回 None（调用方回退独占路径）。
+        """
+        async with self._lock:
+            self._last_demand_at = time.monotonic()
+            best: Optional[PooledContainer] = None
+            best_inflight = max_per_container
+            for container in self._available_containers:
+                if container.age_seconds > self._max_container_age_seconds:
+                    continue
+                if not container.is_healthy:
+                    continue
+                inflight = self._shared_inflight.get(container.container_id, 0)
+                if inflight < best_inflight:
+                    best = container
+                    best_inflight = inflight
+            if best is None:
+                self._scale_up_on_miss()
+                return None
+            self._shared_inflight[best.container_id] = best_inflight + 1
+            self._total_acquired += 1
+            return best.container_id
+
+    async def release_shared(self, container_id: str) -> None:
+        """共享租约归还：并发计数 -1，归零即清除标记。"""
+        async with self._lock:
+            inflight = self._shared_inflight.get(container_id, 0)
+            if inflight <= 1:
+                self._shared_inflight.pop(container_id, None)
+            else:
+                self._shared_inflight[container_id] = inflight - 1
+
+    def _shared_inflight_count(self, container_id: str) -> int:
+        return self._shared_inflight.get(container_id, 0)
+
+    def _scale_up_on_miss(self) -> None:
+        """借空（miss）时把弹性目标上调一档，并异步触发补池。"""
+        if self._target_size < self._max_pool_size:
+            self._target_size += 1
+            logger.info(f"池借空，弹性目标上调至 {self._target_size}")
+        asyncio.create_task(
+            self._trigger_replenish(), name="container_pool_scale_up"
+        )
 
     async def release(self, container_id: str) -> None:
         """
@@ -397,7 +464,7 @@ class ContainerPool:
             # 检查容器是否健康
             is_healthy = await self._check_container_health(container_id)
             
-            if is_healthy and len(self._available_containers) < self._pool_size:
+            if is_healthy and len(self._available_containers) < self._target_size:
                 # 容器健康且池未满，放回池中
                 container = PooledContainer(
                     container_id=container_id,
@@ -422,7 +489,7 @@ class ContainerPool:
         Requirements: 7.3 (异步创建新的预热容器补充池)
         """
         async with self._lock:
-            needed = self._pool_size - len(self._available_containers)
+            needed = self._target_size - len(self._available_containers)
             
             if needed <= 0:
                 logger.debug("容器池已满，无需补充")
@@ -462,6 +529,10 @@ class ContainerPool:
             expired_containers: List[str] = []
             
             for container in list(self._available_containers):
+                # 共享租约使用中的容器跳过本轮（等并发归零再处理）
+                if self._shared_inflight.get(container.container_id, 0) > 0:
+                    continue
+
                 # 检查容器是否过期
                 if container.age_seconds > self._max_container_age_seconds:
                     expired_containers.append(container.container_id)
@@ -492,17 +563,87 @@ class ContainerPool:
                     f"(不健康: {len(unhealthy_containers)}, 过期: {len(expired_containers)})"
                 )
         
+        # 前瞻性扩容：高水位时提前补容器，别等池借空才被动扩（缩短长尾冷启动）
+        await self._maybe_scale_up_proactive()
+
+        # 空闲缩容：连续无请求超过阈值时把弹性目标下调一档
+        await self._maybe_shrink()
+
         # 触发补充
-        if self.available_count < self._pool_size:
+        if self.available_count < self._target_size:
             await self.replenish()
-    
+
+    async def _maybe_scale_up_proactive(self) -> None:
+        """
+        前瞻性扩容（production-hardening #8）。
+
+        共享租约模式下，容器容量 = 池容器数 × 每容器并发上限。当在途并发
+        （shared_inflight + 独占借出）逼近容量高水位（默认 75%）时，提前把
+        弹性目标上调一档并补池——而不是等池彻底借空、超额请求落到临时容器
+        冷启动（10~25s 长尾）。空闲时此路径不触发（在途为 0）。
+        """
+        if self._target_size >= self._max_pool_size:
+            return
+
+        max_per = max(1, int(getattr(settings.pool, "shared_max_per_container", 1)))
+        async with self._lock:
+            pool_containers = len(self._all_containers)
+            if pool_containers == 0:
+                return
+            inflight = sum(self._shared_inflight.values()) + len(self._leased_containers)
+            capacity = pool_containers * max_per
+            # 高水位阈值 75%：留出补一档容器的提前量
+            if capacity > 0 and inflight >= 0.75 * capacity:
+                self._target_size += 1
+                self._last_demand_at = time.monotonic()
+                logger.info(
+                    f"池在途 {inflight}/{capacity}（≥75%），前瞻扩容目标上调至 {self._target_size}"
+                )
+                should_replenish = True
+            else:
+                should_replenish = False
+        if should_replenish:
+            await self.replenish()
+
+    async def _maybe_shrink(self) -> None:
+        """
+        空闲缩容。
+
+        距离最后一次借用请求超过 idle_shrink_seconds 时，
+        把弹性目标下调一档（不低于 min_pool_size），并销毁多余容器，
+        释放小型服务器上的常驻内存。
+        """
+        idle_seconds = time.monotonic() - self._last_demand_at
+        if idle_seconds < self._idle_shrink_seconds:
+            return
+        if self._target_size <= self._min_pool_size:
+            return
+
+        self._target_size -= 1
+        # 重置空闲计时，避免一次健康检查里连续缩到底
+        self._last_demand_at = time.monotonic()
+        logger.info(
+            f"池空闲 {idle_seconds:.0f}s，弹性目标下调至 {self._target_size}"
+        )
+
+        async with self._lock:
+            removable = [
+                c for c in self._available_containers
+                if self._shared_inflight.get(c.container_id, 0) == 0
+            ]
+            while (
+                len(self._available_containers) > self._target_size and removable
+            ):
+                container = removable.pop()
+                await self._remove_pooled_container(container.container_id)
+
     async def _fill_pool(self) -> None:
         """
         填充容器池到目标大小
         
         Requirements: 7.1 (维护可配置数量的预热容器)
         """
-        needed = self._pool_size - len(self._available_containers)
+        needed = self._target_size - len(self._available_containers)
         
         if needed <= 0:
             return
@@ -535,9 +676,12 @@ class ContainerPool:
         """
         container_id: Optional[str] = None
         try:
-            # 构建容器配置
+            # 构建容器配置（含实例 ID：多实例共享 daemon 时清理只清本实例）
+            from ..config import resolve_instance_id
+
             labels = {
                 self.POOL_LABEL_KEY: self.POOL_LABEL_VALUE,
+                self.INSTANCE_LABEL_KEY: resolve_instance_id(),
                 "sandbox.created_at": datetime.now().isoformat(),
             }
             
@@ -699,6 +843,14 @@ class ContainerPool:
             logger.debug(f"容器已移除: {container_id[:12]}")
         except Exception as e:
             logger.warning(f"移除容器失败: {container_id[:12]}, 错误: {e}")
+        finally:
+            # 主动失效 direct 直连 IP 缓存（容器没了，缓存的 IP 必然失效）
+            try:
+                from ..executor import CodeExecutor
+
+                CodeExecutor.invalidate_ip_cache(container_id)
+            except Exception:
+                pass
     
     async def _remove_pooled_container(self, container_id: str) -> None:
         """
@@ -738,6 +890,11 @@ class ContainerPool:
             
             # 检查是否健康
             if not container.is_healthy:
+                continue
+            
+            # 正被共享租约使用的容器不可独占借出
+            # （独占方会注入数据/清理 workspace，打断并发执行）
+            if self._shared_inflight.get(container.container_id, 0) > 0:
                 continue
             
             return container
@@ -793,16 +950,24 @@ class ContainerPool:
         在初始化时清理之前运行遗留的预热容器。
         """
         try:
-            # 查找带有预热标签的容器
+            # 只清理本实例的旧预热容器（多实例共享 daemon 时不误删兄弟实例的）
+            from ..config import resolve_instance_id
+
+            instance_id = resolve_instance_id()
             containers = await self._docker_client.list_containers(
                 all=True,
                 filters={
-                    "label": f"{self.POOL_LABEL_KEY}={self.POOL_LABEL_VALUE}"
+                    "label": [
+                        f"{self.POOL_LABEL_KEY}={self.POOL_LABEL_VALUE}",
+                        f"{self.INSTANCE_LABEL_KEY}={instance_id}",
+                    ]
                 }
             )
             
             if containers:
-                logger.info(f"发现 {len(containers)} 个旧预热容器，正在清理...")
+                logger.info(
+                    f"发现 {len(containers)} 个本实例（{instance_id}）旧预热容器，正在清理..."
+                )
                 
                 for container in containers:
                     try:

@@ -1,0 +1,146 @@
+# KernelDock K8s 部署（DinD sidecar 模式）
+#
+# 设计：网关 Pod 内置 docker:dind sidecar，沙箱容器全部跑在 DinD 里，
+# 不依赖节点的 docker.sock（兼容 containerd 集群），Pod 删除即全部回收。
+#
+# 前置：
+#   1. 集群允许 privileged Pod（DinD 必需；介意的话考虑 Sysbox/Kata 方案）
+#   2. 沙箱镜像可被 DinD 拉取：推荐推到内网 registry，
+#      并把 SANDBOX_DOCKER_IMAGE 改为 registry 地址
+#
+# 使用：kubectl apply -f kerneldock.yaml
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kerneldock
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kerneldock-config
+  namespace: kerneldock
+data:
+  SANDBOX_DOCKER_SOCKET: "tcp://localhost:2375"
+  SANDBOX_DOCKER_IMAGE: "kerneldock-sandbox:v2.0.0"
+  SANDBOX_POOL__POOL_SIZE: "2"
+  SANDBOX_POOL__MIN_POOL_SIZE: "1"
+  SANDBOX_POOL__MAX_POOL_SIZE: "4"
+  SANDBOX_POOL__IDLE_SHRINK_SECONDS: "600"
+  SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS: "8"
+  SANDBOX_RESOURCE__DEFAULT_CPU: "1.0"
+  SANDBOX_RESOURCE__DEFAULT_MEMORY_MB: "512"
+  SANDBOX_TIMEOUT__EXECUTION_TIMEOUT: "300"
+  SANDBOX_VALIDATION_MODE: "warn"
+  SANDBOX_ALLOW_LOCAL_FALLBACK: "false"
+  WORKSPACE_DIR: "/workspace"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kerneldock-secrets
+  namespace: kerneldock
+type: Opaque
+stringData:
+  # 生产务必改成强随机值，逗号分隔可配多个
+  SANDBOX_API_KEYS: "change-me-to-a-strong-key"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kerneldock-workspace
+  namespace: kerneldock
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kerneldock
+  namespace: kerneldock
+spec:
+  replicas: 1   # 单副本简单模式；水平扩展用 kerneldock-cluster.yaml（router+多节点）
+  selector:
+    matchLabels:
+      app: kerneldock
+  template:
+    metadata:
+      labels:
+        app: kerneldock
+    spec:
+      containers:
+        - name: gateway
+          image: kerneldock:latest   # 改为你的 registry 地址
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: kerneldock-config
+            - secretRef:
+                name: kerneldock-secrets
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: "200m"
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+
+        - name: dind
+          image: docker:27-dind
+          securityContext:
+            privileged: true   # DinD 必需
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""        # Pod 内 localhost 通信，关闭 TLS
+          args:
+            - "--host=tcp://0.0.0.0:2375"
+            - "--storage-driver=overlay2"
+          volumeMounts:
+            - name: dind-storage
+              mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "3"        # 沙箱实际算力在这里
+              memory: 6Gi
+
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: kerneldock-workspace
+        - name: dind-storage
+          emptyDir:
+            sizeLimit: 20Gi   # 沙箱镜像 + 容器层；Pod 重建即清空
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kerneldock
+  namespace: kerneldock
+spec:
+  selector:
+    app: kerneldock
+  ports:
+    - port: 9527
+      targetPort: 8080

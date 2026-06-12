@@ -159,6 +159,18 @@ class SandboxNetworkConfig(BaseModel):
         ],
         description="禁止访问的 CIDR 列表"
     )
+    egress_mode: str = Field(
+        default="none",
+        description=(
+            "沙箱出站策略: none=完全禁网（默认） / proxy=经白名单代理出站。"
+            "proxy 模式下沙箱接入沙箱网络，HTTP(S)_PROXY 指向 egress_proxy_url，"
+            "白名单由代理容器（compose profile 'egress' 的 tinyproxy）维护。"
+        )
+    )
+    egress_proxy_url: str = Field(
+        default="http://egress-proxy:8888",
+        description="白名单代理地址（egress_mode=proxy 时注入沙箱环境变量）"
+    )
 
 
 class SandboxSecurityConfig(BaseModel):
@@ -288,6 +300,39 @@ class FireAndForgetConfig(BaseModel):
     )
 
 
+class JobsConfig(BaseModel):
+    """
+    后台任务配置
+
+    长时执行（异步提交 + 轮询）模式：任务不占用 HTTP 执行队列，
+    走独立信号量限流，结果保留一段时间供轮询。
+    """
+    max_concurrent: int = Field(
+        default=2,
+        ge=1,
+        le=16,
+        description="后台任务并发上限（独立于 HTTP 执行队列）"
+    )
+    max_timeout: int = Field(
+        default=3600,
+        ge=60,
+        le=24 * 3600,
+        description="单个后台任务允许的最大超时（秒）"
+    )
+    retention_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=24 * 3600,
+        description="已完成任务结果保留时长（秒），过期自动清理"
+    )
+    max_entries: int = Field(
+        default=500,
+        ge=10,
+        le=10000,
+        description="任务记录总数上限，超过时淘汰最旧的已完成记录"
+    )
+
+
 class ContainerPoolConfig(BaseModel):
     """
     容器池配置
@@ -299,7 +344,39 @@ class ContainerPoolConfig(BaseModel):
         default=3, 
         ge=0, 
         le=20, 
-        description="预热容器数量"
+        description="常态预热容器数量（弹性伸缩的基准值）"
+    )
+    min_pool_size: int = Field(
+        default=1,
+        ge=0,
+        le=20,
+        description="空闲期缩容下限（小型服务器建议 1，避免内存常驻浪费）"
+    )
+    max_pool_size: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description="高峰期扩容上限"
+    )
+    idle_shrink_seconds: int = Field(
+        default=600,
+        ge=60,
+        le=86400,
+        description="池连续空闲多少秒后向 min_pool_size 缩容一档"
+    )
+    shared_stateless: bool = Field(
+        default=False,
+        description=(
+            "无状态共享租约：纯代码执行（无数据注入）的请求共享池容器并发 fork，"
+            "不独占借出，并发密度 = 池大小 × shared_max_per_container。"
+            "代价：并发期间 /output、/tmp 跨请求可见，仅建议单租户部署开启。"
+        )
+    )
+    shared_max_per_container: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="共享租约下单容器最大并发 fork 数（与容器内 KERNEL_MAX_FORKS 联动）"
     )
     max_concurrent_sandboxes: int = Field(
         default=20, 
@@ -370,6 +447,10 @@ class SandboxSettings(BaseSettings):
         default_factory=FireAndForgetConfig,
         description="即用即毁执行配置"
     )
+    jobs: JobsConfig = Field(
+        default_factory=JobsConfig,
+        description="后台任务配置（异步提交 + 轮询）"
+    )
     
     # 基础配置
     docker_image: str = Field(
@@ -399,6 +480,14 @@ class SandboxSettings(BaseSettings):
         default="sandbox_network",
         description="沙箱网络名称"
     )
+    instance_id: str = Field(
+        default="",
+        description=(
+            "本网关实例 ID（用于容器标签隔离）。多实例共享同一 Docker daemon 时，"
+            "启动清理只清本实例的容器，避免误删兄弟实例的沙箱。"
+            "留空时自动取 NODE_NAME / hostname。"
+        ),
+    )
     
     # Sentry 配置
     sentry_dsn: str = Field(
@@ -415,11 +504,76 @@ class SandboxSettings(BaseSettings):
         default="",
         description="管理端点访问 token"
     )
+    api_keys: str = Field(
+        default="",
+        description="API 访问密钥，逗号分隔多个；留空表示不启用认证（仅限开发环境）"
+    )
+    rate_limit_per_minute: int = Field(
+        default=0,
+        ge=0,
+        le=100000,
+        description="每客户端（API Key 或 IP）每分钟请求上限；0 表示禁用限流"
+    )
+    rate_limit_burst: int = Field(
+        default=0,
+        ge=0,
+        le=100000,
+        description="限流令牌桶突发容量；0 表示取 rate_limit_per_minute 的值"
+    )
+    kernel_transport: str = Field(
+        default="relay",
+        description=(
+            "网关与沙箱 kernel 的通信方式: "
+            "relay=docker exec 中继（沙箱 network=none 物理禁网，最保守，~600ms/次开销） / "
+            "direct=TCP 直连（沙箱接 internal 网络，无外网路由，<1ms/次；"
+            "攻击面略增：容器有网络栈、同网络沙箱间可互通）。"
+            "direct 失败时自动回退 relay，再回退 docker exec。"
+        )
+    )
+    session_db_path: str = Field(
+        default="",
+        description=(
+            "会话 SQLite 持久化文件路径。留空时自动使用 $WORKSPACE_DIR/sessions.db；"
+            "设为 'off' 禁用持久化（纯内存，重启丢会话）"
+        )
+    )
+    validation_mode: str = Field(
+        default="warn",
+        description=(
+            "AST 静态校验模式: block=拦截违规代码 / warn=仅记录告警放行 / off=关闭。"
+            "黑名单挡不住真正的攻击且易误杀正常分析代码，安全边界应依赖容器隔离，"
+            "默认 warn 仅作提示。"
+        )
+    )
     allow_local_fallback: bool = Field(
         default=False,
         description="是否允许 Docker 沙箱不可用时回退到本地 subprocess 执行"
     )
     
+    @field_validator("kernel_transport")
+    @classmethod
+    def validate_kernel_transport(cls, v: str) -> str:
+        """校验 kernel_transport 取值，非法时回退 relay。"""
+        normalized = (v or "").strip().lower()
+        if normalized not in {"relay", "direct"}:
+            logging.getLogger(__name__).warning(
+                f"无效的 kernel_transport: '{v}'，回退到默认值 'relay'"
+            )
+            return "relay"
+        return normalized
+
+    @field_validator("validation_mode")
+    @classmethod
+    def validate_validation_mode(cls, v: str) -> str:
+        """校验 validation_mode 取值，非法时回退 warn 并记录告警。"""
+        normalized = (v or "").strip().lower()
+        if normalized not in {"block", "warn", "off"}:
+            logging.getLogger(__name__).warning(
+                f"无效的 validation_mode: '{v}'，回退到默认值 'warn'"
+            )
+            return "warn"
+        return normalized
+
     @field_validator("log_level")
     @classmethod
     def validate_log_level(cls, v: str) -> str:
@@ -866,3 +1020,24 @@ _settings = _create_settings()
 
 # 导出 settings 对象供其他模块使用
 settings = _settings
+
+
+def resolve_instance_id() -> str:
+    """
+    解析本网关实例 ID（容器标签隔离用）。
+
+    优先级：settings.instance_id > 环境变量 NODE_NAME > 容器 hostname。
+    多实例共享同一 Docker daemon 时，靠它区分各实例的容器，
+    启动清理只清自己的，避免误删兄弟实例的沙箱（production-hardening #1）。
+    """
+    import os
+    import re
+    import socket
+
+    raw = (getattr(settings, "instance_id", "") or "").strip()
+    if not raw:
+        raw = (os.environ.get("NODE_NAME") or "").strip()
+    if not raw:
+        raw = socket.gethostname()
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "-", raw).strip("-")
+    return cleaned or "default"

@@ -24,6 +24,12 @@ KernelDock 是一个面向 LLM、Agent 和数据分析应用的 Python 沙箱执
 - 支持文件上传、共享数据目录、只读挂载和结果下载
 - 暴露 Prometheus 指标、健康检查、全局统计和队列状态
 - 支持容器级资源限制、会话超时和空闲回收
+- Shell 命令执行（与代码执行同一隔离边界）
+- 容器内文件系统 API（list / read / write / delete，目录白名单）
+- 运行时 pip 装包（egress 白名单代理模式下）
+- 长时后台任务（异步提交 + 轮询，不阻塞同步请求）
+- MCP server 包装，任何 MCP 客户端（Claude / Cursor 等）可直接接入
+- 分布式多节点部署：无状态 router + 节点自注册，`docker compose up -d` 或 `kubectl scale` 即可加节点
 
 ## 适用场景
 
@@ -40,12 +46,31 @@ KernelDock 是一个面向 LLM、Agent 和数据分析应用的 Python 沙箱执
 
 ## 架构概览
 
-![Architecture Overview](assets/architecture-overview.svg)
+```mermaid
+flowchart LR
+    Client["客户端 / Agent<br/>(REST · SSE · WebSocket · MCP)"] --> GW
+
+    subgraph Node["KernelDock 网关 (FastAPI)"]
+        GW["认证 · 限流 · 路由"] --> Q["执行队列<br/>(并发闸门)"]
+        Q --> SM["SandboxManager"]
+        SM --> Pool["预热容器池<br/>(弹性伸缩 · 共享租约)"]
+        SM --> Store[("SessionStore<br/>SQLite + WAL")]
+    end
+
+    Pool -->|TCP direct / docker exec relay| K1["沙箱容器<br/>常驻 Kernel"]
+    Pool --> K2["沙箱容器<br/>常驻 Kernel"]
+    K1 -->|per-request fork| F["隔离子进程<br/>(CoW 共享预热库)"]
+
+    DSP["docker-socket-proxy<br/>(最小权限 Docker API)"] -.-> Pool
+    GW -.->|可选| Egress["egress 白名单代理"]
+```
 
 执行路径有两种：
 
 - 无状态模式：从预热池借用容器，执行结束后清理 namespace 并归还池中。
 - 有状态模式：为 session 绑定沙箱，适合多轮分析、反复调试和跨请求复用变量。
+
+多机水平扩展时，前置一个无状态 router 把流量分发到多个网关节点（见下文「分布式多节点部署」）。
 
 ## 项目亮点
 
@@ -210,6 +235,22 @@ curl -X POST http://localhost:9527/sessions/<session_id>/execute \
 | GET | `/sessions/{id}/files` | 列出文件 |
 | GET | `/sessions/{id}/files/{type}/{name}` | 下载文件 |
 
+### Agent 扩展接口
+
+| Method | Path | Description |
+|------|------|------|
+| POST | `/sessions/{id}/shell` | 会话沙箱内执行 shell 命令 |
+| POST | `/execute/shell` | 无状态 shell 执行（独占租约 + kernel 健康检查） |
+| GET | `/sessions/{id}/fs/list` | 列出容器内目录（白名单：/data /output /tmp /home/sandbox） |
+| GET | `/sessions/{id}/fs/read` | 读取容器内文件（base64） |
+| PUT | `/sessions/{id}/fs/write` | 写入容器内文件（自动建父目录） |
+| DELETE | `/sessions/{id}/fs` | 删除容器内文件/目录 |
+| POST | `/sessions/{id}/packages` | 运行时 pip 装包（需 egress proxy 模式） |
+| POST | `/jobs` | 提交长时后台任务（异步） |
+| GET | `/jobs` | 列出后台任务 |
+| GET | `/jobs/{id}` | 查询任务状态与结果 |
+| DELETE | `/jobs/{id}` | 取消任务 |
+
 ### 沙箱管理接口
 
 | Method | Path | Description |
@@ -218,6 +259,65 @@ curl -X POST http://localhost:9527/sessions/<session_id>/execute \
 | GET | `/sandboxes/{id}` | 查询沙箱详情 |
 | DELETE | `/sandboxes/{id}` | 强制销毁沙箱 |
 | GET | `/sandboxes/{id}/metrics` | 查询沙箱资源指标 |
+
+## MCP 接入
+
+仓库自带 MCP server 包装（`mcp_server/kerneldock_mcp.py`），把执行 / shell / 文件 / 装包 / 后台任务全部暴露为 MCP 工具，Claude Desktop、Cursor 等 MCP 客户端零成本接入：
+
+```bash
+pip install -r requirements-mcp.txt
+```
+
+客户端配置示例：
+
+```json
+{
+  "mcpServers": {
+    "kerneldock": {
+      "command": "python",
+      "args": ["/path/to/mcp_server/kerneldock_mcp.py"],
+      "env": {
+        "KERNELDOCK_URL": "http://localhost:9527",
+        "KERNELDOCK_API_KEY": "your-api-key"
+      }
+    }
+  }
+}
+```
+
+提供的工具：`execute_python`、`create_session` / `execute_in_session` / `delete_session`、`run_shell`、`list_files` / `read_file` / `write_file`、`install_packages`、`submit_job` / `get_job`、`get_chart`。
+
+端到端验证：`python tests/mcp_e2e.py`（官方 mcp SDK stdio 客户端逐个实调全部 12 个工具）。
+
+## 分布式多节点部署
+
+多台服务器水平扩展沙箱并发：每台节点机照常 `docker compose up -d`（节点侧零改动），再起一个无状态 router 把流量按规则分发（设计详见 `deploy/distributed-design.md`）：
+
+```bash
+# router 机器
+ROUTER_NODES="n1=http://10.0.0.1:9527,n2=http://10.0.0.2:9527" \
+  docker compose -f docker-compose.router.yml up -d
+# 客户端 base_url 改为 http://<router>:9500，其余零感知
+```
+
+- **无状态执行**（`/execute`、`/execute/shell`、无 session 的 `/jobs`）按各节点队列水位分发到最闲节点——N 节点 ≈ N 倍无状态吞吐
+- **会话/任务粘性**：创建类响应里的 `session_id` / `job_id` / `sandboxID` 自动带上节点前缀（如 `n1:uuid`），后续请求按前缀直达所属节点；ID 对客户端是不透明字符串，SDK / MCP / E2B 适配层零感知
+- **聚合观测**：router 的 `/health` 汇总全部节点，`/metrics` 同时输出 router 自身指标（`router_schedule_total` 等）与各节点指标（自动注入 `node` label），`/jobs`、`/sandboxes` 跨节点合并；`X-Request-Id` 贯穿 router→node 便于链路排障
+- **高可用**：router 完全无状态，多跑几个实例 + DNS 轮询/VIP 即可；节点宕机后其会话丢失（客户端重建），无状态流量秒级摘除；优雅停机（drain + graceful shutdown）滚动更新不切在途请求
+- **安全默认**：router 管理端点（注册/摘除节点）未配 `ROUTER_ADMIN_TOKEN` 时默认拒绝写操作（防注册劫持），生产务必设令牌；本地可信网络可设 `ROUTER_ALLOW_INSECURE_ADMIN=true` 放行
+
+**加节点 = 一条命令**（节点自注册）：新机器上
+
+```bash
+ROUTER_URL=http://<router>:9500 NODE_NAME=n3 \
+  NODE_ADVERTISE_URL=http://<本机IP>:9527 docker compose up -d
+```
+
+节点启动即自动注册进集群并周期心跳（默认 10s）；心跳断超过 `ROUTER_NODE_TTL`（默认 30s）自动摘除，重启自动回归。也可以不用自注册，在 router 的 `ROUTER_NODES` 静态配置节点表。`GET /admin/nodes` 查看集群成员（可用 `ROUTER_ADMIN_TOKEN` 保护管理端点）。
+
+端到端验证：`python tests/router_e2e.py`（路由/粘性/聚合）、`python tests/router_phase2_e2e.py`（自注册/心跳/摘除/回归），单机可用 `docker-compose.node2.yml` 模拟第二节点。
+
+K8s 集群形态见 `deploy/k8s/kerneldock-cluster.yaml`（router + node 双 StatefulSet，`kubectl scale` 即扩缩节点，详见 `deploy/k8s/README.md`）。
 
 ## 响应结构
 
@@ -259,23 +359,42 @@ curl -X POST http://localhost:9527/sessions/<session_id>/execute \
 - 关闭本地回退模式：`SANDBOX_ALLOW_LOCAL_FALLBACK=false`
 - 根据业务规模调优容器池和资源限制
 
+## 供应链与镜像安全
+
+CI（`.github/workflows/code-executor-ci.yml`）在语法门禁 + 单元测试之外，还有两道供应链防线：
+
+- **依赖审计**（`pip-audit`）：网关 / router / MCP 三个入口依赖一旦出现「有修复版本」的已知漏洞即挡红；沙箱数据科学全家桶仅告警（这类 CVE 多不可利用、上游修复滞后，强行阻断会让 PR 无法合入，高危项人工评估后在 `requirements.lock` 升级）。
+- **镜像扫描**（Trivy）：构建网关与 router 镜像后分层扫描——**应用库层**（我们 `requirements` 装的包）命中高危/严重即挡红；**基础镜像 OS 层**（debian 包）仅告警，避免被上游 base 镜像的补丁节奏绑架。两个 Dockerfile 均 `apt-get upgrade` 拉安全补丁并升级 pip 工具链，把可控漏洞治本清零。
+- 误报或「已评估不可利用」的 CVE 在 `.trivyignore` 登记（需写明理由与复核日期）。
+
+本地复现：
+
+```bash
+pip install pip-audit
+pip-audit -r requirements-gateway.txt -r requirements-router.txt -r requirements-mcp.txt
+# 镜像扫描（需 Docker）
+docker build -t kerneldock:ci . && trivy image --severity CRITICAL,HIGH --ignore-unfixed kerneldock:ci
+```
+
 ## 关键配置
 
 下面的值以仓库自带 `docker-compose.yml` 为例：
 
-| 变量 | 示例值 | 说明 |
+| 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `SANDBOX_DOCKER_IMAGE` | `kerneldock-sandbox:v2.0.0` | 沙箱镜像标签 |
-| `SANDBOX_POOL__POOL_SIZE` | `4` | 预热容器数，决定常态并发能力 |
-| `SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS` | `4` | 执行队列并发上限，建议与池大小一致 |
-| `SANDBOX_RESOURCE__DEFAULT_CPU` | `1.0` | 单沙箱默认 CPU 限额 |
-| `SANDBOX_RESOURCE__DEFAULT_MEMORY_MB` | `512` | 单沙箱默认内存限额 |
-| `SANDBOX_RESOURCE__DEFAULT_DISK_MB` | `1024` | 单沙箱默认磁盘限额 |
-| `SANDBOX_TIMEOUT__EXECUTION_TIMEOUT` | `300` | 单次执行超时 |
-| `SANDBOX_TIMEOUT__SESSION_IDLE_TIMEOUT` | `600` | 会话空闲超时 |
-| `CORS_ALLOWED_ORIGINS` | 空 | 开发环境可留空，生产务必收紧 |
+| `SANDBOX_POOL__POOL_SIZE` | `2` | 常态预热容器数 |
+| `SANDBOX_POOL__MIN_POOL_SIZE` / `MAX_POOL_SIZE` | `1` / `4` | 弹性伸缩下/上限：空闲缩容、借空与高水位扩容 |
+| `SANDBOX_POOL__SHARED_STATELESS` | `true` | 无状态执行共享池容器并发 fork（单租户密度更高；多租户置 `false`） |
+| `SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS` | `16` | 执行队列并发闸门（共享租约下 ≈ 池 × 单容器并发） |
+| `SANDBOX_RESOURCE__DEFAULT_CPU` / `DEFAULT_MEMORY_MB` | `1.0` / `512` | 单沙箱默认 CPU / 内存限额 |
+| `SANDBOX_TIMEOUT__EXECUTION_TIMEOUT` / `SESSION_IDLE_TIMEOUT` | `300` / `600` | 单次执行超时 / 会话空闲超时 |
+| `SANDBOX_KERNEL_TRANSPORT` | `direct` | `direct`=TCP 直连（低延迟）；`relay`=docker exec 中继（物理禁网更保守） |
+| `SANDBOX_NETWORK__EGRESS_MODE` | `none` | `none`=禁网；`proxy`=经白名单代理出站（pip 装包需此模式） |
+| `SANDBOX_API_KEYS` | 空 | 逗号分隔；留空禁用认证（仅限开发，生产必配） |
+| `CORS_ALLOWED_ORIGINS` | 空 | 开发可留空，生产务必收紧 |
 
-经验上，4C8G 机器可以从 `pool_size=4`、`memory=512MB` 起步，再根据真实负载调整。
+经验上，4C8G 机器可以从 `pool_size=2`（弹性上限 4）、`memory=512MB` 起步，再根据真实负载调整。
 
 ## 可观测性
 
@@ -291,34 +410,43 @@ curl -X POST http://localhost:9527/sessions/<session_id>/execute \
 
 ## 开发与测试
 
+单元测试（无需 Docker，CI 同款子集）：
+
 ```bash
-# 运行测试
-pytest
+pytest -q \
+  --ignore=tests/integration \
+  --ignore=tests/test_enriched_response.py \
+  --ignore=tests/mcp_e2e.py \
+  --ignore=tests/router_e2e.py \
+  --ignore=tests/router_phase2_e2e.py
+```
 
-# 集成测试
+面向运行中服务的端到端脚本（需先启动网关，独立运行，不被 pytest 收集）：
+
+```bash
+# MCP 全工具实连（官方 mcp SDK stdio 客户端）
+python tests/mcp_e2e.py
+# 分布式 router：路由/粘性/聚合，以及自注册/心跳/摘除
+python tests/router_e2e.py
+python tests/router_phase2_e2e.py
+# 增强响应与并发压测
 python tests/test_enriched_response.py --url http://localhost:9527
-
-# 并发压力测试
 python tests/stress_test.py --url http://localhost:9527 --scenario all -c 10 -n 30
 ```
 
-仓库中还包含以下测试方向：
-
-- 容器池与会话管理
-- 流式执行与增强响应
-- 指标导出与管理接口
-- 数据上下文隔离
-- 卷挂载与共享数据目录
-- 冷启动与性能基线
+单元测试覆盖：容器池与会话管理、流式执行与增强响应、指标导出与管理接口、
+数据上下文隔离、卷挂载、会话持久化、API Key 校验、router 路由/调度/节点生命周期等。
 
 ## 路线方向
 
 适合继续增强的方向包括：
 
-- 更细粒度的镜像分层与依赖裁剪
+- 更细粒度的镜像分层与依赖裁剪、更短的冷启动
 - 更明确的 API 文档和 OpenAPI 示例
 - 更丰富的沙箱策略配置与审计日志
-- 更完善的 Helm / Kubernetes 部署方案
+- Helm Chart 与真实多节点集群的部署验证
+- gVisor 强隔离在 Linux 宿主上的性能基线
+- E2B 官方 SDK 的协议级（envd / WSS）兼容
 
 ## 贡献
 

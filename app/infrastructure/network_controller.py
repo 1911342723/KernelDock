@@ -4,11 +4,6 @@
 管理沙箱容器的网络隔离和访问控制。
 包括隔离网络创建、容器网络连接/断开、网络策略配置等功能。
 
-Requirements:
-- 3.1: 默认禁止沙箱访问外部网络
-- 3.2: 配置允许外网访问时，仅允许访问白名单中的域名或 IP
-- 3.3: 禁止沙箱访问宿主机的内部网络（172.17.0.0/16、10.0.0.0/8、192.168.0.0/16）
-- 3.4: 禁止沙箱之间的直接网络通信
 """
 
 import asyncio
@@ -117,11 +112,6 @@ class NetworkController:
     管理沙箱的网络隔离和访问控制。
     使用 Docker 网络实现容器间隔离，通过 iptables 规则实现访问控制。
     
-    Requirements:
-    - 3.1: 默认禁止沙箱访问外部网络
-    - 3.2: 配置允许外网访问时，仅允许访问白名单中的域名或 IP
-    - 3.3: 禁止沙箱访问宿主机的内部网络
-    - 3.4: 禁止沙箱之间的直接网络通信
     
     网络隔离策略:
     - 每个沙箱使用独立的网络命名空间
@@ -131,7 +121,6 @@ class NetworkController:
     """
     
     # 默认禁止访问的内部网络 CIDR
-    # Requirements: 3.3 (禁止访问宿主机内部网络)
     BLOCKED_CIDRS = [
         "10.0.0.0/8",       # 私有网络 A 类
         "172.16.0.0/12",    # 私有网络 B 类（包含 Docker 默认网络 172.17.0.0/16）
@@ -271,7 +260,6 @@ class NetworkController:
                 logger.info(f"创建隔离网络: {self._network_name}")
                 
                 # 创建网络配置
-                # Requirements:
                 # - 3.1: internal=True 禁止外部访问
                 # - 3.4: enable_icc=false 禁止容器间通信
                 ipam_config = docker.types.IPAMConfig(
@@ -287,11 +275,10 @@ class NetworkController:
                     self.client.networks.create,
                     name=self._network_name,
                     driver="bridge",
-                    internal=True,  # Requirements 3.1: 禁止外部访问
+                    internal=True,
                     enable_ipv6=False,
                     ipam=ipam_config,
                     options={
-                        # Requirements 3.4: 禁止容器间通信
                         "com.docker.network.bridge.enable_icc": "false",
                         "com.docker.network.bridge.enable_ip_masquerade": "false",
                     },
@@ -501,7 +488,6 @@ class NetworkController:
             }
         
         # 如果不允许出站流量，使用 internal 网络
-        # Requirements 3.1: 默认禁止外部网络访问
         if not policy.allow_outbound:
             return {
                 "network_mode": "none"  # 完全隔离
@@ -536,12 +522,10 @@ class NetworkController:
             return "none"
         
         # 不允许出站 -> none（完全隔离）
-        # Requirements 3.1: 默认禁止外部网络访问
         if not policy.allow_outbound:
             return "none"
         
         # 允许出站但有白名单限制 -> 使用自定义网络
-        # Requirements 3.2: 仅允许访问白名单中的域名或 IP
         return self._network_name
     
     def validate_network_access(
@@ -578,7 +562,6 @@ class NetworkController:
         try:
             ip = ipaddress.ip_address(target)
             # 检查是否在禁止的 CIDR 范围内
-            # Requirements 3.3: 禁止访问内部网络
             if policy.is_cidr_denied(str(ip)):
                 logger.debug(f"网络访问被拒绝（CIDR 黑名单）: {target}")
                 return False
@@ -587,7 +570,6 @@ class NetworkController:
             pass
         
         # 检查白名单
-        # Requirements 3.2: 仅允许访问白名单中的域名或 IP
         if policy.allowed_hosts and target not in policy.allowed_hosts:
             logger.debug(f"网络访问被拒绝（不在白名单）: {target}")
             return False

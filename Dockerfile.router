@@ -1,0 +1,22 @@
+# KernelDock Router 镜像（无状态路由网关）
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 拉基础镜像安全补丁 + 升级 pip 工具链（修 base image 自带的 OS / setuptools CVE）
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --upgrade pip setuptools wheel
+
+COPY requirements-router.txt .
+RUN pip install --no-cache-dir -r requirements-router.txt
+
+COPY router/kerneldock_router.py router/
+
+# 非 root 运行
+RUN useradd -m -u 1000 router
+USER router
+
+EXPOSE 9500
+CMD ["python", "router/kerneldock_router.py"]

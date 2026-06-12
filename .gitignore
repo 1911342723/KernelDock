@@ -23,13 +23,21 @@ dist/
 .benchmarks/
 htmlcov/
 coverage.xml
-build-base.log
-build-sandbox.log
+*.log
+stress-report*.txt
 
-# IDE
+# IDE / 本地编辑器配置
 .idea/
 .vscode/
+# Cursor 本地配置与插件（含本机绝对路径、插件数据目录，勿入库）
+.cursor/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# 内部维护文档（仅本地查阅，不随仓库发布）
+任务.md
+未来计划.md
+经验.md
+deploy/production-hardening.md

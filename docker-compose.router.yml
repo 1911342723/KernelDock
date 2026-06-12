@@ -1,0 +1,45 @@
+# KernelDock Router 部署（分布式多节点路由层）
+#
+# 用法：
+#   1. 各节点机器照常 `docker compose up -d`（节点侧零改动）
+#   2. router 机器：
+#        ROUTER_NODES="n1=http://10.0.0.1:9527,n2=http://10.0.0.2:9527" \
+#          docker compose -f docker-compose.router.yml up -d
+#   3. 客户端 base_url 指向 http://<router>:9500，其余零感知
+#
+# 高可用：router 完全无状态，多台机器各跑一个本服务 + DNS 轮询/VIP 即可。
+
+services:
+  router:
+    build:
+      context: .
+      dockerfile: Dockerfile.router
+    image: kerneldock-router:latest
+    container_name: kerneldock-router
+    restart: unless-stopped
+    ports:
+      - "9500:9500"
+    environment:
+      # 静态节点列表，"名字=URL" 逗号分隔；名字只能含 [a-z0-9_-]，会成为资源 ID 前缀。
+      # 可留空：节点配置 ROUTER_URL 启动后自动注册（心跳 TTL 管理）
+      - ROUTER_NODES=${ROUTER_NODES:-}
+      - ROUTER_PORT=9500
+      - ROUTER_HEALTH_INTERVAL=${ROUTER_HEALTH_INTERVAL:-2.0}
+      - ROUTER_UPSTREAM_TIMEOUT=${ROUTER_UPSTREAM_TIMEOUT:-660}
+      # 动态节点心跳过期秒数（节点侧心跳间隔默认 10s，TTL 应 ≥ 2~3 倍心跳）
+      - ROUTER_NODE_TTL=${ROUTER_NODE_TTL:-30}
+      # /admin/* 写操作令牌（强烈建议生产设置）；设置后节点侧需配同样的 ROUTER_ADMIN_TOKEN。
+      # 未设置时写操作默认被拒（防节点注册劫持）；本地可信网络可设
+      # ROUTER_ALLOW_INSECURE_ADMIN=true 放行无令牌写。
+      - ROUTER_ADMIN_TOKEN=${ROUTER_ADMIN_TOKEN:-}
+      - ROUTER_ALLOW_INSECURE_ADMIN=${ROUTER_ALLOW_INSECURE_ADMIN:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9500/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M

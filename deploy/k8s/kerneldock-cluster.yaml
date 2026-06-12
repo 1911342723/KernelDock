@@ -1,0 +1,301 @@
+# KernelDock K8s 分布式集群形态（Phase 3）
+#
+# 拓扑：
+#   - kerneldock-router StatefulSet（默认 1 副本，可扩；稳定 per-pod DNS）
+#   - kerneldock-node   StatefulSet（gateway + DinD sidecar；默认 2 副本）
+#     节点 pod 启动即向全部 router 副本自注册心跳（Phase 2 机制），
+#     扩缩容零配置：`kubectl scale statefulset kerneldock-node --replicas=N`
+#     新节点自动入集群，缩掉的节点心跳断 TTL（默认 30s）后自动摘除。
+#
+# 与 kerneldock.yaml（单副本简单模式）的关系：二选一部署，本文件是多节点形态。
+#
+# 前置：
+#   1. 三个镜像推到集群可达 registry 并改下方镜像地址：
+#      kerneldock:latest / kerneldock-router:latest / kerneldock-sandbox:v2.0.0
+#   2. 集群允许 privileged Pod（DinD 必需）
+#   3. 生产改掉 Secret 里的两个默认值
+#
+# 使用：kubectl apply -f kerneldock-cluster.yaml
+# 验证：kubectl -n kerneldock port-forward svc/kerneldock-router 9500:9500
+#       curl http://localhost:9500/health
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kerneldock
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kerneldock-secrets
+  namespace: kerneldock
+type: Opaque
+stringData:
+  # 生产务必改成强随机值
+  SANDBOX_API_KEYS: "change-me-to-a-strong-key"
+  ROUTER_ADMIN_TOKEN: "change-me-router-admin-token"
+---
+# ===================== Router =====================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kerneldock-router-config
+  namespace: kerneldock
+data:
+  ROUTER_NODES: ""                 # 全部走节点自注册，不配静态表
+  ROUTER_HEALTH_INTERVAL: "2.0"
+  ROUTER_UPSTREAM_TIMEOUT: "660"
+  ROUTER_NODE_TTL: "30"
+---
+# headless：给 router pod 稳定 DNS（kerneldock-router-0.kerneldock-router-hl...）。
+# publishNotReadyAddresses=true：router 还没 Ready 时节点心跳也能解析到它，
+# 避免"router 无节点不 Ready → DNS 不发布 → 节点注册不进来"的死锁。
+apiVersion: v1
+kind: Service
+metadata:
+  name: kerneldock-router-hl
+  namespace: kerneldock
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: kerneldock-router
+  ports:
+    - port: 9500
+      name: http
+---
+# 客户端入口（集群内 ClusterIP；对外按需换 LoadBalancer/Ingress）
+apiVersion: v1
+kind: Service
+metadata:
+  name: kerneldock-router
+  namespace: kerneldock
+spec:
+  selector:
+    app: kerneldock-router
+  ports:
+    - port: 9500
+      targetPort: 9500
+      name: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kerneldock-router
+  namespace: kerneldock
+spec:
+  serviceName: kerneldock-router-hl
+  # 扩到 2+ 副本时：把新副本的 pod DNS 追加进 node ConfigMap 的 ROUTER_URL
+  # 列表并 rollout kerneldock-node（每个 router 副本独立维护节点表，
+  # 节点心跳必须发给每一个副本）
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kerneldock-router
+  template:
+    metadata:
+      labels:
+        app: kerneldock-router
+    spec:
+      # 优雅停机：preStop 先 drain（/health 转 503 摘除流量）再等 uvicorn
+      # graceful shutdown 收尾在途请求
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: router
+          image: kerneldock-router:latest   # 改为你的 registry 地址
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "python -c \"import os,urllib.request as u; r=u.Request('http://localhost:9500/admin/drain', method='POST'); t=os.environ.get('ROUTER_ADMIN_TOKEN'); r.add_header('X-Admin-Token', t) if t else None; u.urlopen(r, timeout=5)\" || true; sleep 8"
+          ports:
+            - containerPort: 9500
+          envFrom:
+            - configMapRef:
+                name: kerneldock-router-config
+          env:
+            - name: ROUTER_PORT
+              value: "9500"
+            - name: ROUTER_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kerneldock-secrets
+                  key: ROUTER_ADMIN_TOKEN
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 256Mi
+          # 注意用 TCP 而非 /health：router 在零节点时 /health 返回 503，
+          # 若以此作 readiness 会死锁（NotReady → 节点注册不进来）
+          readinessProbe:
+            tcpSocket:
+              port: 9500
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9500
+            initialDelaySeconds: 10
+            periodSeconds: 30
+---
+# ===================== Nodes =====================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kerneldock-node-config
+  namespace: kerneldock
+data:
+  SANDBOX_DOCKER_SOCKET: "tcp://localhost:2375"
+  SANDBOX_DOCKER_IMAGE: "kerneldock-sandbox:v2.0.0"   # 改为 registry 地址（DinD 要拉取）
+  # 网关容器不是 DinD daemon 管的容器，direct 模式"网关自连沙箱网络"必然失败，
+  # 显式 relay 省掉每次启动的回退告警（DinD 内安全语义同 network=none 物理禁网）
+  SANDBOX_KERNEL_TRANSPORT: "relay"
+  SANDBOX_POOL__POOL_SIZE: "2"
+  SANDBOX_POOL__MIN_POOL_SIZE: "1"
+  SANDBOX_POOL__MAX_POOL_SIZE: "4"
+  SANDBOX_POOL__IDLE_SHRINK_SECONDS: "600"
+  SANDBOX_POOL__SHARED_STATELESS: "true"
+  SANDBOX_POOL__SHARED_MAX_PER_CONTAINER: "4"
+  SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS: "16"
+  SANDBOX_RESOURCE__DEFAULT_CPU: "1.0"
+  SANDBOX_RESOURCE__DEFAULT_MEMORY_MB: "512"
+  SANDBOX_TIMEOUT__EXECUTION_TIMEOUT: "300"
+  SANDBOX_VALIDATION_MODE: "warn"
+  SANDBOX_ALLOW_LOCAL_FALLBACK: "false"
+  WORKSPACE_DIR: "/workspace"
+  # 节点 → 全部 router 副本的心跳地址（逗号分隔；router 扩副本时在此追加）
+  ROUTER_URL: "http://kerneldock-router-0.kerneldock-router-hl.kerneldock.svc.cluster.local:9500"
+  ROUTER_HEARTBEAT_INTERVAL: "10"
+---
+# headless：给节点 pod 稳定 DNS，router 经它直达各节点
+apiVersion: v1
+kind: Service
+metadata:
+  name: kerneldock-node-hl
+  namespace: kerneldock
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: kerneldock-node
+  ports:
+    - port: 8080
+      name: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kerneldock-node
+  namespace: kerneldock
+spec:
+  serviceName: kerneldock-node-hl
+  replicas: 2          # 加节点：kubectl scale statefulset kerneldock-node --replicas=N
+  selector:
+    matchLabels:
+      app: kerneldock-node
+  template:
+    metadata:
+      labels:
+        app: kerneldock-node
+    spec:
+      # 节点优雅停机：preStop sleep 让 router 心跳超时摘除本节点（停止派新活），
+      # uvicorn graceful shutdown（CMD --timeout-graceful-shutdown 25）收尾在途执行
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: gateway
+          image: kerneldock:latest   # 改为你的 registry 地址
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 8"]
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: kerneldock-node-config
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SANDBOX_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: kerneldock-secrets
+                  key: SANDBOX_API_KEYS
+            - name: ROUTER_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kerneldock-secrets
+                  key: ROUTER_ADMIN_TOKEN
+            # 节点名 = pod 名（kerneldock-node-0/1/...），即资源 ID 前缀
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              value: "$(POD_NAME)"
+            # router 访问本节点的稳定地址（StatefulSet per-pod DNS）
+            - name: NODE_ADVERTISE_URL
+              value: "http://$(POD_NAME).kerneldock-node-hl.kerneldock.svc.cluster.local:8080"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: "200m"
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+
+        - name: dind
+          image: docker:27-dind
+          securityContext:
+            privileged: true   # DinD 必需
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""        # Pod 内 localhost 通信，关闭 TLS
+          args:
+            - "--host=tcp://0.0.0.0:2375"
+            - "--storage-driver=overlay2"
+          volumeMounts:
+            - name: dind-storage
+              mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "3"        # 沙箱实际算力在这里
+              memory: 6Gi
+
+      volumes:
+        - name: dind-storage
+          emptyDir:
+            sizeLimit: 20Gi   # 沙箱镜像 + 容器层；Pod 重建即清空（介意冷启动可改 PVC）
+
+  # 每个节点独立的 workspace（SQLite 会话存储等）
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

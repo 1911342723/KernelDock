@@ -5,10 +5,6 @@ Docker 客户端封装模块
 包括容器创建、启动、停止、删除、执行命令等方法，
 以及容器状态查询和资源使用监控。
 
-Requirements:
-- 1.1: 在 5 秒内创建并启动沙箱容器
-- 1.3: 查询沙箱状态（运行状态、资源使用、创建时间）
-- 1.4: 强制停止并删除容器
 """
 
 import asyncio
@@ -144,6 +140,7 @@ class DockerClient:
             }
 
         return await asyncio.to_thread(_fetch)
+
     @property
     def client(self) -> docker.DockerClient:
         """
@@ -164,7 +161,13 @@ class DockerClient:
                 # 测试连接；使用短超时避免 daemon 卡死时把上游请求拖满 60s。
                 probe_client.ping()
                 probe_client.close()
-                self._client = docker.DockerClient(base_url=self._socket)
+                # max_pool_size：默认 10 在高并发下会打满连接池
+                # （"Connection pool is full, discarding connection" 告警），
+                # 取队列并发上限的 4 倍兜底。
+                self._client = docker.DockerClient(
+                    base_url=self._socket,
+                    max_pool_size=64,
+                )
                 logger.debug("Docker 客户端连接成功")
             except Exception as e:
                 logger.error(f"无法连接到 Docker daemon: {e}")
@@ -604,10 +607,23 @@ class DockerClient:
 
             stream_result = await self._run_in_executor(container.exec_run, **exec_kwargs)
             iterator = stream_result.output
-            while True:
+
+            # 不能直接 await run_in_executor(next, it)：迭代器耗尽时
+            # StopIteration 无法穿过 Future（asyncio 会转成
+            # "StopIteration interacts badly with generators" 的 TypeError
+            # 抛给事件循环），这个 await 永远不返回 → SSE 挂死。
+            # 必须在线程内捕获并转换成哨兵值。
+            _SENTINEL = object()
+
+            def _next_or_sentinel(it):
                 try:
-                    chunk = await self._run_in_executor(next, iterator)
+                    return next(it)
                 except StopIteration:
+                    return _SENTINEL
+
+            while True:
+                chunk = await self._run_in_executor(_next_or_sentinel, iterator)
+                if chunk is _SENTINEL:
                     break
                 if isinstance(chunk, tuple):
                     yield chunk
@@ -728,6 +744,78 @@ class DockerClient:
             info = await self.get_container_status(container_id)
             return info.state == ContainerState.RUNNING
         except SandboxNotFoundError:
+            return False
+
+    async def get_container_ip(
+        self,
+        container_id: str,
+        network_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        获取容器在指定网络上的 IP 地址。
+
+        Args:
+            container_id: 容器 ID
+            network_name: 网络名称；为 None 时返回第一个有 IP 的网络地址
+
+        Returns:
+            IP 字符串；容器无网络（network=none）或不存在时返回 None
+        """
+        try:
+            container = await self._get_container(container_id)
+            networks = (
+                container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+            )
+            if network_name:
+                net = networks.get(network_name)
+                ip = (net or {}).get("IPAddress") or None
+                return ip
+            for net in networks.values():
+                ip = net.get("IPAddress")
+                if ip:
+                    return ip
+            return None
+        except Exception as e:
+            logger.debug(f"获取容器 IP 失败: {container_id[:12]}, {e}")
+            return None
+
+    async def connect_container_to_network(
+        self, container_id: str, network_name: str
+    ) -> bool:
+        """把容器接入指定网络（已在网络中则视为成功）。"""
+        try:
+            network = await self._run_in_executor(
+                self.client.networks.get, network_name
+            )
+            await self._run_in_executor(network.connect, container_id)
+            return True
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                return True
+            logger.warning(f"容器接入网络失败: {container_id[:12]} -> {network_name}, {e}")
+            return False
+
+    async def ensure_internal_network(self, network_name: str) -> bool:
+        """确保一个 internal 网络存在（无外网路由，容器间互通）。"""
+        try:
+            await self._run_in_executor(self.client.networks.get, network_name)
+            return True
+        except Exception:
+            pass
+        try:
+            await self._run_in_executor(
+                lambda: self.client.networks.create(
+                    name=network_name,
+                    driver="bridge",
+                    internal=True,
+                    enable_ipv6=False,
+                    labels={"sandbox.network": "kernel-direct"},
+                )
+            )
+            logger.info(f"已创建 kernel 直连 internal 网络: {network_name}")
+            return True
+        except Exception as e:
+            logger.warning(f"创建 kernel 直连网络失败: {network_name}, {e}")
             return False
 
     async def pull_image(self, image: str) -> bool:
@@ -991,7 +1079,58 @@ class DockerClient:
                 message=f"put_archive 失败: {str(e)}",
                 original_error=e
             )
-    
+
+    async def get_archive(
+        self,
+        container_id: str,
+        path: str,
+        max_bytes: int = 64 * 1024 * 1024,
+    ) -> bytes:
+        """
+        通过 Docker get_archive API 读取容器内路径，返回 tar 归档字节。
+
+        与 put_archive 对称：单次 API 调用取回文件内容，
+        不经过 shell，无输出截断/转义问题。
+
+        Args:
+            container_id: 容器 ID
+            path: 容器内的文件或目录路径
+            max_bytes: 归档大小上限（防止误读超大文件拖垮网关）
+
+        Returns:
+            tar 格式的归档数据（bytes）
+
+        Raises:
+            SandboxNotFoundError: 容器不存在
+            InternalError: 读取失败或超出大小上限
+        """
+        try:
+            container = await self._get_container(container_id)
+
+            def _fetch() -> bytes:
+                stream, _stat = container.get_archive(path)
+                chunks = []
+                total = 0
+                for chunk in stream:
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise InternalError(
+                            message=f"get_archive 超出大小上限 {max_bytes} bytes: {path}"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+            return await self._run_in_executor(_fetch)
+        except SandboxNotFoundError:
+            raise
+        except InternalError:
+            raise
+        except Exception as e:
+            raise InternalError(
+                message=f"get_archive 失败: {str(e)}",
+                original_error=e
+            )
+
     async def close(self) -> None:
         """
         关闭 Docker 客户端连接

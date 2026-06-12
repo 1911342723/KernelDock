@@ -1,0 +1,134 @@
+name: code-executor-ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  syntax-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install gateway dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-gateway.txt
+          pip install -r requirements-router.txt
+          pip install pytest pytest-asyncio aiohttp
+
+      # 语法门禁：任何运行时代码出现 SyntaxError 直接挡住
+      # （经验：kernel_server.py 曾带语法错误上线，靠静默回退掩盖）
+      - name: Syntax gate (compileall)
+        run: python -m compileall -q app sandbox_runtime router mcp_server tests
+
+      # 无 Docker 单测子集（integration/performance/docker 需要真实环境；
+      # test_enriched_response / mcp_e2e / router_e2e 是面向运行中服务的独立脚本）
+      - name: Unit tests (no Docker)
+        run: >
+          python -m pytest tests/ -q
+          --ignore=tests/integration
+          --ignore=tests/performance
+          --ignore=tests/docker
+          --ignore=tests/test_enriched_response.py
+          --ignore=tests/mcp_e2e.py
+          --ignore=tests/router_e2e.py
+          --ignore=tests/router_phase2_e2e.py
+
+  # 依赖审计：网关侧（会进生产镜像）依赖出现"有修复版本"的已知漏洞即挡红。
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      # 网关 / router / MCP 三个入口依赖：严格阻断（这些依赖少、可控）
+      - name: Audit gateway / router / mcp deps (blocking)
+        run: |
+          pip-audit --strict --progress-spinner=off \
+            -r requirements-gateway.txt \
+            -r requirements-router.txt \
+            -r requirements-mcp.txt
+
+      # 沙箱镜像数据科学全家桶（pandas/numpy/...）：仅告警不阻断——
+      # 这类 CVE 多为不可利用或上游修复滞后，强行阻断会让 PR 永远绿不了。
+      # 真正高危需人工评估后在 requirements.lock 升级。
+      - name: Audit sandbox deps (advisory only)
+        continue-on-error: true
+        run: |
+          pip-audit --progress-spinner=off -r requirements.txt || true
+
+  # 镜像漏洞扫描：构建对外服务镜像（网关 + router）并用 Trivy 扫 OS 层 + Python 库。
+  image-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # CI 在 GitHub runner（海外）构建，关掉国内镜像源走默认 PyPI / Debian 源
+      - name: Build gateway image
+        run: docker build --build-arg USE_CHINA_MIRROR=0 -t kerneldock:ci .
+
+      - name: Build router image
+        run: docker build -f Dockerfile.router -t kerneldock-router:ci .
+
+      # 应用依赖层（我们 requirements 装的库）：命中有修复版本的高危/严重即挡红——
+      # 这是我们能直接控制的依赖，必须治。
+      - name: Scan gateway image — app libraries (blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: kerneldock:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: library
+          exit-code: "1"
+          trivyignores: .trivyignore
+
+      - name: Scan router image — app libraries (blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: kerneldock-router:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: library
+          exit-code: "1"
+          trivyignores: .trivyignore
+
+      # 基础镜像 OS 层（debian 包，如 openssl/gnutls）：仅告警不阻断——
+      # Dockerfile 已 apt-get upgrade 拉补丁，但修复节奏受上游 base 镜像约束，
+      # 强行阻断会让 PR 被 base 镜像 CVE 绑架。高危项由此可见，按需在 .trivyignore 登记。
+      - name: Scan images — OS layer (advisory)
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          image-ref: kerneldock:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os
+          exit-code: "0"
+
+      # Dockerfile 配置审计（misconfig）：仅告警，不阻断
+      - name: Scan Dockerfiles (config, advisory)
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"

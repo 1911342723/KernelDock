@@ -6,10 +6,6 @@ WebSocket 路由模块
 - 会话持久连接
 - 执行中断
 
-Requirements:
-- 11.1: 提供 WebSocket 端点用于代码执行
-- 11.2: 支持实时输出推送
-- 11.3: 支持执行中断
 """
 
 import asyncio
@@ -93,6 +89,34 @@ class ConnectionManager:
         if session_id in self.session_to_connection:
             connection_id = self.session_to_connection[session_id]
             await self.send_message(connection_id, message)
+
+
+def _check_ws_auth(websocket: WebSocket) -> bool:
+    """
+    WebSocket 认证：HTTP 中间件不拦截 WS 握手，这里单独校验。
+
+    支持三种携带方式（浏览器原生 WebSocket 无法自定义 header，
+    故额外支持 query 参数）：
+      - Authorization: Bearer <key>
+      - X-API-Key: <key>
+      - ws://host/ws?api_key=<key>
+
+    未配置 SANDBOX_API_KEYS 时放行（与 HTTP 行为一致）。
+    """
+    raw = getattr(settings, "api_keys", "") or ""
+    valid_keys = {k.strip() for k in raw.split(",") if k.strip()}
+    if not valid_keys:
+        return True
+
+    auth_header = websocket.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        if auth_header[7:].strip() in valid_keys:
+            return True
+    if websocket.headers.get("x-api-key", "").strip() in valid_keys:
+        return True
+    if websocket.query_params.get("api_key", "").strip() in valid_keys:
+        return True
+    return False
 
 
 # 全局连接管理器
@@ -487,6 +511,10 @@ async def websocket_endpoint(websocket: WebSocket):
     
     注意：WebSocket 消息大小限制需要在 uvicorn 启动时配置 --ws-max-size
     """
+    if not _check_ws_auth(websocket):
+        await websocket.close(code=4401, reason="Invalid or missing API key")
+        return
+
     connection_id = str(uuid.uuid4())
     await connection_manager.connect(websocket, connection_id)
     
@@ -582,6 +610,10 @@ async def websocket_session_endpoint(websocket: WebSocket, session_id: str):
     
     自动绑定到指定会话，简化客户端使用。
     """
+    if not _check_ws_auth(websocket):
+        await websocket.close(code=4401, reason="Invalid or missing API key")
+        return
+
     connection_id = str(uuid.uuid4())
     await connection_manager.connect(websocket, connection_id)
     connection_manager.bind_session(session_id, connection_id)

@@ -1,0 +1,11 @@
+# 出站域名白名单（tinyproxy filter，每行一个正则；FilterDefaultDeny=Yes 即不在此列的全部拒绝）
+# 按需取消注释或追加。改动后重启 egress-proxy 容器生效。
+
+# --- PyPI 官方与清华镜像（pip install 场景）---
+^pypi\.org$
+^files\.pythonhosted\.org$
+^pypi\.tuna\.tsinghua\.edu\.cn$
+
+# --- 示例：放行公司对象存储（替换为实际域名）---
+# ^.*\.oss-cn-hangzhou\.aliyuncs\.com$
+# ^.*\.cos\.ap-guangzhou\.myqcloud\.com$

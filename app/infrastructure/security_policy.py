@@ -4,14 +4,6 @@
 管理沙箱容器的安全配置，包括用户权限、特权模式、文件系统权限、
 Linux capabilities 限制和进程数限制等安全相关设置。
 
-Requirements:
-- 6.1: 以非 root 用户身份运行沙箱内的代码
-- 6.2: 禁用沙箱容器的特权模式
-- 6.3: 设置只读的根文件系统（除数据和输出目录外）
-- 6.4: 限制沙箱可使用的 Linux capabilities（仅保留必要的能力）
-- 6.5: 禁止沙箱内的进程执行 fork bomb 攻击（限制进程数量）
-- 6.6: 禁止沙箱访问宿主机的 Docker socket
-- 6.7: 检测到可疑行为时记录安全事件到日志
 """
 
 import logging
@@ -37,7 +29,6 @@ class SecurityLevel(Enum):
 
 
 # 默认要移除的 Linux capabilities
-# Requirements 6.4: 限制沙箱可使用的 Linux capabilities
 # 移除所有危险的 capabilities，只保留必要的最小集合
 DEFAULT_CAP_DROP = [
     "ALL"  # 移除所有 capabilities，然后通过 cap_add 添加必要的
@@ -84,19 +75,16 @@ DEFAULT_SECURITY_OPT = [
 ]
 
 # 默认进程数限制
-# Requirements 6.5: 防止 fork bomb 攻击
 DEFAULT_PIDS_LIMIT = 100
 MIN_PIDS_LIMIT = 10
 MAX_PIDS_LIMIT = 500
 
 # 默认沙箱用户配置
-# Requirements 6.1: 以非 root 用户身份运行
 DEFAULT_USER = "sandbox"
 DEFAULT_USER_ID = 1000
 DEFAULT_GROUP_ID = 1000
 
 # Docker socket 路径（需要禁止访问）
-# Requirements 6.6: 禁止沙箱访问宿主机的 Docker socket
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 
 
@@ -108,13 +96,6 @@ class SecurityPolicy:
     定义沙箱容器的安全配置，包括用户权限、特权模式、文件系统权限、
     Linux capabilities 限制和进程数限制等。
     
-    Requirements:
-    - 6.1: 以非 root 用户身份运行沙箱内的代码
-    - 6.2: 禁用沙箱容器的特权模式
-    - 6.3: 设置只读的根文件系统（除数据和输出目录外）
-    - 6.4: 限制沙箱可使用的 Linux capabilities
-    - 6.5: 禁止 fork bomb 攻击（限制进程数量）
-    - 6.6: 禁止沙箱访问宿主机的 Docker socket
     
     Attributes:
         user: 运行用户（格式: "uid:gid" 或用户名）
@@ -234,19 +215,14 @@ class SecurityPolicy:
             - tmpfs: tmpfs 挂载配置
         """
         config: Dict[str, Any] = {
-            # Requirements 6.1: 非 root 用户运行
             "user": self.user,
             
-            # Requirements 6.2: 禁用特权模式
             "privileged": False,  # 强制禁用，忽略 self.privileged
             
-            # Requirements 6.3: 只读根文件系统
             "read_only": self.read_only_rootfs,
             
-            # Requirements 6.4: Linux capabilities 限制
             "cap_drop": self.cap_drop,
             
-            # Requirements 6.5: 进程数限制
             "pids_limit": self.pids_limit,
             
             # 安全选项

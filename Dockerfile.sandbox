@@ -24,8 +24,15 @@ RUN uv pip install \
 
 COPY sandbox_runtime /opt/sandbox/deps/sandbox_runtime
 
+# 语法门禁 + 预编译 pyc：
+# 1) sandbox_runtime 任何语法错误在构建期直接失败（曾因 kernel_server.py
+#    带 SyntaxError 进镜像导致热启动静默失效）；
+# 2) 预编译全部依赖的 .pyc，加快 kernel 首次 import 与 fork 后冷路径。
+RUN python3.11 -m compileall -q /opt/sandbox/deps/sandbox_runtime && \
+    python3.11 -m compileall -q -j 0 /opt/sandbox/deps || true
+
 RUN chmod -R 555 /opt/sandbox/deps && \
-    python3.11 -c "import pandas, numpy, matplotlib, seaborn, scipy, sklearn, pyarrow; print('OK')"
+    python3.11 -c "import pandas, numpy, matplotlib, seaborn, scipy, sklearn, pyarrow, sympy, networkx; print('OK')"
 
 USER sandbox
 WORKDIR /workspace

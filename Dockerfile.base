@@ -3,7 +3,7 @@ FROM python:3.11-slim
 
 ARG UV_VERSION
 ARG USE_CHINA_MIRROR=1
-ARG PYTHON_VERSION=3.11
+ARG INSTALL_FULL_CJK_FONTS=0
 ARG USER_UID=1000
 ARG USER_GID=1000
 
@@ -18,32 +18,28 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
         if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-            sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+            sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources; \
         fi; \
     fi
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 镜像瘦身：requirements.lock 中全部依赖均有 manylinux 预编译 wheel，
+# 无需 gcc/g++/build-essential 编译链；也没有依赖 GDAL/GEOS/PROJ/graphviz
+# 的包，相关 -dev 库全部移除。只保留运行期真正需要的字体与图形库。
+# 中文字体默认仅 wqy-microhei（几 MB，matplotlib 中文够用）；
+# 需要 Noto CJK 全集时 --build-arg INSTALL_FULL_CJK_FONTS=1。
+RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    curl \
-    wget \
-    git \
     passwd \
-    build-essential \
-    gcc \
-    g++ \
-    graphviz \
-    libcairo2 \
     libfreetype6 \
-    libgdal-dev \
-    libgeos-dev \
-    libglib2.0-0 \
-    libgl1 \
     libpng16-16 \
-    libproj-dev \
-    fonts-noto-cjk \
     fonts-wqy-microhei \
     fontconfig \
-    && rm -rf /var/lib/apt/lists/*
+    && if [ "$INSTALL_FULL_CJK_FONTS" = "1" ]; then \
+        apt-get install -y --no-install-recommends fonts-noto-cjk; \
+    fi \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
         pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn "uv==${UV_VERSION}"; \
@@ -59,6 +55,10 @@ RUN groupadd --gid ${USER_GID} sandbox && \
     chmod 755 /workspace /data /output && \
     chmod 1777 /tmp
 
+# BLAS/OMP 线程数限制：单沙箱限额 1 CPU，BLAS 默认按宿主核数开 32+ 线程
+# 毫无意义，且并发 fork 时会撞 pids_limit（实测报
+# "OpenBLAS blas_thread_init: pthread_create failed ... Resource temporarily
+# unavailable"）。强制单线程 BLAS，numpy/scipy 在 1C 限额下反而更快。
 ENV MPLBACKEND=Agg \
     QT_QPA_PLATFORM=offscreen \
     MPLCONFIGDIR=/tmp/matplotlib \
@@ -66,6 +66,11 @@ ENV MPLBACKEND=Agg \
     DATA_DIR=/data \
     OUTPUT_DIR=/output \
     WORKSPACE_DIR=/workspace \
-    KERNEL_PORT=9999
+    KERNEL_PORT=9999 \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    VECLIB_MAXIMUM_THREADS=1
 
 WORKDIR /workspace

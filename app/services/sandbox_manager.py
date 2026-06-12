@@ -4,175 +4,77 @@
 负责沙箱生命周期管理的核心组件，整合 Docker 客户端、资源限制器、
 网络控制器、容器池和安全策略，提供沙箱创建、销毁、状态查询等功能。
 
-Requirements:
-- 1.1: 在 5 秒内创建并启动沙箱容器
-- 1.2: 沙箱空闲超过配置的超时时间时自动销毁
-- 1.3: 查询沙箱状态（运行状态、资源使用情况、创建时间）
-- 1.4: 强制停止并删除沙箱容器
-- 1.5: 支持同时管理至少 50 个并发沙箱实例
+按职责拆分：
+- sandbox_models.py        SandboxState / SandboxInfo / _SandboxRecord
+- sandbox_execution.py     代码执行（有状态 / 流式 / 无状态）Mixin
+- sandbox_provisioning.py  容器创建与网络/池配置 Mixin
+- 本文件                    生命周期编排（创建/销毁/查询/后台清理）
 """
 
 import asyncio
-from collections.abc import AsyncIterator
 import logging
 import os
 import shutil
 import time
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from ..config import settings
 from ..exceptions import (
     ContainerPoolExhaustedError,
-    InternalError,
     SandboxCreationError,
     SandboxNotFoundError,
 )
 from ..infrastructure.container_pool import ContainerPool
 from ..infrastructure.docker_client import ContainerState, DockerClient
-from ..infrastructure.network_controller import NetworkController, NetworkPolicy
-from ..infrastructure.resource_limiter import ResourceLimiter, ResourceLimits, ResourceUsage
+from ..infrastructure.network_controller import NetworkController
+from ..infrastructure.resource_limiter import ResourceLimiter, ResourceUsage
 from ..infrastructure.security_policy import SecurityPolicy, create_default_security_policy
+from .sandbox_agent_ops import SandboxAgentOpsMixin
+from .sandbox_execution import SandboxExecutionMixin
+from .sandbox_models import SandboxInfo, SandboxState, _SandboxRecord
+from .sandbox_provisioning import SandboxProvisioningMixin
 
 logger = logging.getLogger(__name__)
 
-
-class SandboxState(Enum):
-    """
-    沙箱状态枚举
-    
-    定义沙箱的各种运行状态。
-    """
-    CREATING = "creating"      # 创建中
-    RUNNING = "running"        # 运行中
-    PAUSED = "paused"          # 已暂停
-    STOPPED = "stopped"        # 已停止
-    ERROR = "error"            # 错误状态
+__all__ = ["SandboxManager", "SandboxState", "SandboxInfo"]
 
 
-@dataclass
-class SandboxInfo:
-    """
-    沙箱信息数据类
-    
-    包含沙箱的完整信息，包括标识、状态、资源配置和目录路径。
-    
-    Requirements: 1.3 (查询沙箱状态 - 运行状态、资源使用情况、创建时间)
-    
-    Attributes:
-        sandbox_id: 沙箱唯一标识
-        session_id: 关联的会话 ID
-        container_id: Docker 容器 ID
-        state: 当前状态
-        created_at: 创建时间
-        last_activity: 最后活动时间
-        cpu_limit: CPU 限制（核心数）
-        memory_limit_mb: 内存限制（MB）
-        disk_limit_mb: 磁盘限制（MB）
-        network_enabled: 是否启用网络
-        data_dir: 数据目录路径
-        output_dir: 输出目录路径
-    """
-    sandbox_id: str                    # 沙箱唯一标识
-    session_id: str                    # 关联的会话 ID
-    container_id: str                  # Docker 容器 ID
-    state: SandboxState                # 当前状态
-    created_at: datetime               # 创建时间
-    last_activity: datetime            # 最后活动时间
-    cpu_limit: float                   # CPU 限制（核心数）
-    memory_limit_mb: int               # 内存限制（MB）
-    disk_limit_mb: int                 # 磁盘限制（MB）
-    network_enabled: bool              # 是否启用网络
-    data_dir: str                      # 数据目录路径
-    output_dir: str                    # 输出目录路径
-
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        转换为字典格式
-        
-        Returns:
-            包含沙箱信息的字典
-        """
-        return {
-            "sandbox_id": self.sandbox_id,
-            "session_id": self.session_id,
-            "container_id": self.container_id,
-            "state": self.state.value,
-            "created_at": self.created_at.isoformat(),
-            "last_activity": self.last_activity.isoformat(),
-            "cpu_limit": self.cpu_limit,
-            "memory_limit_mb": self.memory_limit_mb,
-            "disk_limit_mb": self.disk_limit_mb,
-            "network_enabled": self.network_enabled,
-            "data_dir": self.data_dir,
-            "output_dir": self.output_dir,
-        }
-    
-    def __str__(self) -> str:
-        """返回沙箱信息的字符串表示"""
-        return (
-            f"SandboxInfo(id={self.sandbox_id[:8]}, "
-            f"session={self.session_id[:8]}, "
-            f"state={self.state.value}, "
-            f"cpu={self.cpu_limit}, "
-            f"memory={self.memory_limit_mb}MB)"
-        )
-
-
-@dataclass
-class _SandboxRecord:
-    """
-    内部沙箱记录数据类
-    
-    用于在 SandboxManager 内部存储沙箱的完整信息。
-    """
-    info: SandboxInfo                  # 沙箱信息
-    resource_limits: ResourceLimits    # 资源限制配置
-    network_policy: NetworkPolicy      # 网络策略
-    security_policy: SecurityPolicy    # 安全策略
-    timeout_seconds: int               # 超时时间（秒）
-
-
-class SandboxManager:
+class SandboxManager(SandboxExecutionMixin, SandboxProvisioningMixin, SandboxAgentOpsMixin):
     """
     沙箱管理器
-    
+
     负责沙箱的创建、销毁、状态管理和资源监控。
     整合 Docker 客户端、资源限制器、网络控制器、容器池和安全策略。
-    
-    Requirements:
-    - 1.1: 在 5 秒内创建并启动沙箱容器
-    - 1.2: 沙箱空闲超过配置的超时时间时自动销毁
-    - 1.3: 查询沙箱状态（运行状态、资源使用情况、创建时间）
-    - 1.4: 强制停止并删除沙箱容器
-    - 1.5: 支持同时管理至少 50 个并发沙箱实例
-    
+    执行/供给/Agent 扩展操作分别由 SandboxExecutionMixin /
+    SandboxProvisioningMixin / SandboxAgentOpsMixin 提供。
+
     使用方式:
     ```python
     manager = SandboxManager()
     await manager.initialize()
-    
+
     # 创建沙箱
     sandbox = await manager.create_sandbox(session_id="session-123")
-    
+
     # 执行代码
     result = await manager.execute_code(sandbox.sandbox_id, "print('hello')")
-    
+
     # 销毁沙箱
     await manager.destroy_sandbox(sandbox.sandbox_id)
-    
+
     # 关闭管理器
     await manager.shutdown()
     ```
     """
-    
+
     # 沙箱容器标签
     SANDBOX_LABEL_KEY = "sandbox.managed"
     SANDBOX_LABEL_VALUE = "true"
-    
+    # 实例标签：多实例共享 daemon 时区分归属，启动清理只清本实例
+    INSTANCE_LABEL_KEY = "sandbox.instance"
+
     def __init__(
         self,
         docker_client: Optional[DockerClient] = None,
@@ -186,7 +88,7 @@ class SandboxManager:
     ):
         """
         初始化沙箱管理器
-        
+
         Args:
             docker_client: Docker 客户端实例（可选，默认创建新实例）
             resource_limiter: 资源限制器实例（可选）
@@ -204,58 +106,57 @@ class SandboxManager:
         )
         self._network_controller = network_controller or NetworkController.from_settings()
         self._security_policy = security_policy or create_default_security_policy()
-        
+
         # 配置参数
         self._max_concurrent = max_concurrent_sandboxes or settings.pool.max_concurrent_sandboxes
         self._workspace_base = workspace_base or settings.workspace_base
         self._docker_image = docker_image or settings.docker_image
-        
+
         # 容器池（延迟初始化）
         self._container_pool = container_pool
         self._pool_initialized = False
-        
+
         # 沙箱存储
-        # Requirements 1.5: 支持同时管理至少 50 个并发沙箱实例
         self._sandboxes: Dict[str, _SandboxRecord] = {}
         self._session_to_sandbox: Dict[str, str] = {}  # session_id -> sandbox_id 映射
-        
+
         # 同步锁
         self._lock = asyncio.Lock()
-        
+
         # 后台任务
         self._cleanup_task: Optional[asyncio.Task] = None
         self._running = False
-        
+
         # 统计信息
         self._total_created = 0
         self._total_destroyed = 0
-        
+
         logger.info(
             f"沙箱管理器初始化，最大并发: {self._max_concurrent}, "
             f"工作空间: {self._workspace_base}, "
             f"镜像: {self._docker_image}"
         )
-    
+
     @classmethod
     def from_settings(cls) -> "SandboxManager":
         """
         从 settings 配置创建沙箱管理器
-        
+
         Returns:
             SandboxManager 实例
         """
         return cls()
-    
+
     @property
     def active_count(self) -> int:
         """获取当前活跃沙箱数量"""
         return len(self._sandboxes)
-    
+
     @property
     def max_concurrent(self) -> int:
         """获取最大并发沙箱数"""
         return self._max_concurrent
-    
+
     @property
     def is_running(self) -> bool:
         """检查管理器是否正在运行"""
@@ -264,54 +165,56 @@ class SandboxManager:
     async def initialize(self) -> None:
         """
         初始化沙箱管理器
-        
+
         创建必要的目录、初始化容器池、启动后台清理任务。
         """
         if self._running:
             logger.warning("沙箱管理器已经在运行中")
             return
-        
+
         logger.info("初始化沙箱管理器...")
         self._running = True
-        
+
         # 确保工作空间目录存在
         os.makedirs(self._workspace_base, exist_ok=True)
-        
+
         # 初始化网络
         await self._network_controller.create_network()
-        
+
+        # 沙箱互联网络：direct 直连接网关自身，egress proxy 接白名单代理
+        await self._setup_sandbox_networks()
+
         # 初始化容器池
         if self._container_pool is None:
             self._container_pool = ContainerPool.from_settings(
                 docker_client=self._docker_client,
                 container_config=self._get_pool_container_config()
             )
-        
+
         if not self._pool_initialized:
             await self._container_pool.initialize()
             self._pool_initialized = True
-        
+
         # 启动后台清理任务
-        # Requirements 1.2: 沙箱空闲超过配置的超时时间时自动销毁
         self._cleanup_task = asyncio.create_task(
             self._cleanup_loop(),
             name="sandbox_cleanup"
         )
-        
+
         # 清理可能存在的旧沙箱容器
         await self._cleanup_stale_sandboxes()
-        
+
         logger.info("沙箱管理器初始化完成")
-    
+
     async def shutdown(self) -> None:
         """
         关闭沙箱管理器
-        
+
         停止后台任务、销毁所有沙箱、关闭容器池。
         """
         logger.info("关闭沙箱管理器...")
         self._running = False
-        
+
         # 取消后台任务
         if self._cleanup_task:
             self._cleanup_task.cancel()
@@ -320,30 +223,30 @@ class SandboxManager:
             except asyncio.CancelledError:
                 pass
             self._cleanup_task = None
-        
+
         # 销毁所有沙箱
         async with self._lock:
             sandbox_ids = list(self._sandboxes.keys())
-        
+
         for sandbox_id in sandbox_ids:
             try:
                 await self.destroy_sandbox(sandbox_id)
             except Exception as e:
                 logger.warning(f"关闭时销毁沙箱失败: {sandbox_id}, 错误: {e}")
-        
+
         # 关闭容器池
         if self._container_pool and self._pool_initialized:
             await self._container_pool.shutdown()
             self._pool_initialized = False
-        
+
         # 关闭网络控制器
         await self._network_controller.close()
-        
+
         # 关闭 Docker 客户端
         await self._docker_client.close()
-        
+
         logger.info("沙箱管理器已关闭")
-    
+
     async def create_sandbox(
         self,
         session_id: str,
@@ -355,9 +258,9 @@ class SandboxManager:
     ) -> SandboxInfo:
         """
         创建新的沙箱实例
-        
+
         Requirements: 1.1 (在 5 秒内创建并启动沙箱容器)
-        
+
         Args:
             session_id: 会话标识符
             cpu_limit: CPU 核心数限制（可选）
@@ -365,18 +268,17 @@ class SandboxManager:
             disk_limit_mb: 磁盘限制（MB，可选）
             network_enabled: 是否启用网络访问（可选）
             timeout_seconds: 沙箱超时时间（秒，可选）
-            
+
         Returns:
             SandboxInfo 对象
-            
+
         Raises:
             ContainerPoolExhaustedError: 达到最大并发数
             SandboxCreationError: 创建失败
         """
         start_time = time.monotonic()
-        
+
         # 检查并发限制
-        # Requirements 1.5: 支持同时管理至少 50 个并发沙箱实例
         async with self._lock:
             if len(self._sandboxes) >= self._max_concurrent:
                 raise ContainerPoolExhaustedError(
@@ -384,12 +286,12 @@ class SandboxManager:
                     active_count=len(self._sandboxes),
                     max_concurrent=self._max_concurrent
                 )
-        
+
         # 生成沙箱 ID
         sandbox_id = self._generate_sandbox_id()
-        
+
         logger.info(f"创建沙箱: {sandbox_id}, 会话: {session_id}")
-        
+
         try:
             # 获取资源限制配置
             resource_limits = self._resource_limiter.get_limits(
@@ -397,19 +299,19 @@ class SandboxManager:
                 memory_mb=memory_limit_mb,
                 disk_mb=disk_limit_mb
             )
-            
+
             # 获取网络策略
             network_policy = self._network_controller.get_default_policy()
             if network_enabled is not None:
                 network_policy.enabled = network_enabled
                 network_policy.allow_outbound = network_enabled
-            
+
             # 获取超时配置
             timeout = timeout_seconds or settings.timeout.session_idle_timeout
-            
+
             # 创建工作空间目录
             data_dir, output_dir, data_dir_readonly = self._create_workspace_dirs(session_id)
-            
+
             # 创建新容器（不使用预热容器池，因为有状态会话需要自定义配置）
             container_id = await self._create_container(
                 sandbox_id=sandbox_id,
@@ -419,7 +321,7 @@ class SandboxManager:
                 output_dir=output_dir,
                 data_dir_readonly=data_dir_readonly,
             )
-            
+
             # 创建沙箱信息
             now = datetime.now()
             sandbox_info = SandboxInfo(
@@ -436,7 +338,7 @@ class SandboxManager:
                 data_dir=data_dir,
                 output_dir=output_dir
             )
-            
+
             # 创建内部记录
             record = _SandboxRecord(
                 info=sandbox_info,
@@ -445,49 +347,48 @@ class SandboxManager:
                 security_policy=self._security_policy,
                 timeout_seconds=timeout
             )
-            
+
             # 存储沙箱记录
             async with self._lock:
                 self._sandboxes[sandbox_id] = record
                 self._session_to_sandbox[session_id] = sandbox_id
                 self._total_created += 1
-            
+
             elapsed = time.monotonic() - start_time
             logger.info(
                 f"沙箱创建成功: {sandbox_id}, "
                 f"容器: {container_id[:12]}, "
                 f"耗时: {elapsed*1000:.2f}ms"
             )
-            
-            # Requirements 1.1: 验证是否在 5 秒内完成
+
             if elapsed > 5.0:
                 logger.warning(f"沙箱创建耗时超过 5 秒: {elapsed:.2f}s")
-            
+
             return sandbox_info
-            
+
         except Exception as e:
             # 清理可能创建的资源
             logger.error(f"创建沙箱失败: {sandbox_id}, 错误: {e}")
             await self._cleanup_sandbox_resources(session_id)
-            
+
             if isinstance(e, (ContainerPoolExhaustedError, SandboxCreationError)):
                 raise
-            
+
             raise SandboxCreationError(
                 reason=str(e),
                 session_id=session_id,
                 original_error=str(e)
             )
-    
+
     async def get_sandbox(self, sandbox_id: str) -> Optional[SandboxInfo]:
         """
         获取沙箱信息
-        
+
         Requirements: 1.3 (查询沙箱状态)
-        
+
         Args:
             sandbox_id: 沙箱 ID
-            
+
         Returns:
             SandboxInfo 对象，如果不存在则返回 None
         """
@@ -495,19 +396,19 @@ class SandboxManager:
             record = self._sandboxes.get(sandbox_id)
             if record is None:
                 return None
-            
+
             # 更新状态
             await self._update_sandbox_state(record)
-            
+
             return record.info
 
     async def get_sandbox_by_session(self, session_id: str) -> Optional[SandboxInfo]:
         """
         通过会话 ID 获取沙箱信息
-        
+
         Args:
             session_id: 会话 ID
-            
+
         Returns:
             SandboxInfo 对象，如果不存在则返回 None
         """
@@ -515,791 +416,66 @@ class SandboxManager:
             sandbox_id = self._session_to_sandbox.get(session_id)
             if sandbox_id is None:
                 return None
-        
+
         return await self.get_sandbox(sandbox_id)
-    
+
     async def destroy_sandbox(self, sandbox_id: str) -> bool:
         """
         销毁沙箱
-        
+
         Requirements: 1.4 (强制停止并删除沙箱容器)
-        
+
         Args:
             sandbox_id: 沙箱 ID
-            
+
         Returns:
             True 如果销毁成功，False 如果沙箱不存在
         """
         logger.info(f"销毁沙箱: {sandbox_id}")
-        
+
         async with self._lock:
             record = self._sandboxes.pop(sandbox_id, None)
             if record is None:
                 logger.warning(f"沙箱不存在: {sandbox_id}")
                 return False
-            
+
             # 移除会话映射
             session_id = record.info.session_id
             if session_id in self._session_to_sandbox:
                 del self._session_to_sandbox[session_id]
-            
+
             self._total_destroyed += 1
-        
+
         # 停止并删除容器
         container_id = record.info.container_id
         try:
             # 断开网络连接
             await self._network_controller.disconnect_container(container_id)
-            
+
             # 停止容器
             await self._docker_client.stop_container(container_id, timeout=5)
-            
+
             # 删除容器
             await self._docker_client.remove_container(container_id, force=True)
-            
+
             logger.info(f"容器已删除: {container_id[:12]}")
-            
+
         except Exception as e:
             logger.warning(f"删除容器时出错: {container_id[:12]}, 错误: {e}")
-        
+        finally:
+            # 主动失效 direct 直连 IP 缓存
+            try:
+                from ..executor import CodeExecutor
+
+                CodeExecutor.invalidate_ip_cache(container_id)
+            except Exception:
+                pass
+
         # 清理工作空间目录
         await self._cleanup_sandbox_resources(session_id)
-        
+
         logger.info(f"沙箱销毁完成: {sandbox_id}")
         return True
-
-    async def execute_code(
-        self,
-        sandbox_id: str,
-        code: str,
-        timeout: int = 300,
-        pre_load_parquet: Optional[Dict[str, str]] = None,
-        bootstrap_source: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        在沙箱中执行代码
-        
-        使用 CodeExecutor 在 Docker 容器内执行代码，支持图表和表格捕获。
-        
-        Requirements:
-        context_id: Optional[str] = None,
-        - 4.2: 代码执行超过配置的超时时间时终止执行并返回超时错误
-        - 4.3: 捕获代码执行的标准输出、标准错误和返回值
-        - 4.4: 自动捕获 matplotlib 生成的图表并转换为 SVG 格式
-        - 4.5: 支持 display_table 函数捕获 DataFrame 数据
-        - 4.6: 代码执行产生异常时返回完整的异常堆栈信息
-
-        multi-table-analysis (executor_protocol_multitable.md):
-        - ``pre_load_parquet``: ``{TableRef: base64(parquet bytes)}``，调用方
-                context_id=context_id,
-        - ``bootstrap_source``: DataLoaderBootstrap Python 源码，透传到
-          ``CodeExecutor.execute_in_container``，由 kernel 在 user code
-          之前 exec。
-
-        Args:
-            sandbox_id: 沙箱 ID
-            code: Python 代码
-            timeout: 执行超时（秒）
-            pre_load_parquet: TableRef → base64 parquet 字节（可选）
-            bootstrap_source: DataLoaderBootstrap 源码（可选）
-            
-        Returns:
-            执行结果字典，包含:
-            - success: 是否成功
-            - output: 输出内容
-            - stdout: 标准输出
-            - stderr: 标准错误
-            - charts: 图表列表（SVG base64）
-            - tables: 表格数据列表
-            - images: 图片路径列表
-            - error: 错误信息（如果有）
-            - execution_time_ms: 执行时间（毫秒）
-            
-        Raises:
-            SandboxNotFoundError: 沙箱不存在
-        """
-        # 导入 CodeExecutor
-        from ..executor import CodeExecutor
-        
-        # 获取沙箱记录
-        async with self._lock:
-            record = self._sandboxes.get(sandbox_id)
-            if record is None:
-                raise SandboxNotFoundError(sandbox_id=sandbox_id)
-            
-            # 更新最后活动时间
-            record.info.last_activity = datetime.now()
-        
-        container_id = record.info.container_id
-        
-        # 使用 CodeExecutor 执行代码
-        # 容器内的数据目录和输出目录路径
-        container_data_dir = "/data"
-        container_output_dir = "/output"
-        
-        # 代码安全验证（AST 静态分析）
-        from .code_validator import validate_code
-        validation_result = validate_code(code)
-        if not validation_result.is_valid:
-            # 返回验证失败结果
-            issues_msg = "; ".join(
-                f"Line {i.line}: {i.message}" for i in validation_result.issues
-            )
-            return {
-                "success": False,
-                "output": "",
-                "stdout": "",
-                "stderr": f"代码安全验证失败: {issues_msg}",
-                "charts": [],
-                "tables": [],
-                "images": [],
-                "error": f"CodeValidationError: {issues_msg}",
-                "execution_time_ms": 0
-            }
-
-        # multi-table-analysis: 把 pre_load_parquet 落盘到容器 /data/<ref>.parquet
-        if pre_load_parquet:
-            if not bootstrap_source:
-                return {
-                    "success": False,
-                    "output": "",
-                    "stdout": "",
-                    "stderr": "pre_load_parquet provided without bootstrap_source",
-                    "charts": [],
-                    "tables": [],
-                    "images": [],
-                    "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
-                    "execution_time_ms": 0,
-                }
-            await self._ensure_materialized_pre_load_parquet(
-                container_id,
-                pre_load_parquet,
-            )
-
-        executor = CodeExecutor(self._docker_client)
-        try:
-            result = await executor.execute_in_container(
-                container_id=container_id,
-                code=code,
-                data_dir=container_data_dir,
-                output_dir=container_output_dir,
-                timeout=timeout,
-                bootstrap_source=bootstrap_source,
-            )
-            return result
-        finally:
-            # 注意：不关闭 executor，因为它使用的是共享的 docker_client
-            pass
-
-    async def stream_execute_code(
-        self,
-        sandbox_id: str,
-        code: str,
-        timeout: int = 300,
-        pre_load_parquet: Optional[Dict[str, str]] = None,
-        bootstrap_source: Optional[str] = None,
-        context_id: Optional[str] = None,
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """流式执行代码，返回 kernel 发出的事件流。"""
-        from ..executor import CodeExecutor
-        from .code_validator import validate_code
-
-        async with self._lock:
-            record = self._sandboxes.get(sandbox_id)
-            if record is None:
-                raise SandboxNotFoundError(sandbox_id=sandbox_id)
-            record.info.last_activity = datetime.now()
-
-        validation_result = validate_code(code)
-        if not validation_result.is_valid:
-            issues_msg = "; ".join(
-                f"Line {i.line}: {i.message}" for i in validation_result.issues
-            )
-            yield {
-                "type": "error",
-                "error": f"CodeValidationError: {issues_msg}",
-            }
-            yield {
-                "type": "done",
-                "success": False,
-                "error": f"CodeValidationError: {issues_msg}",
-                "execution_time_ms": 0,
-                "context_id": context_id,
-                "timed_out": False,
-            }
-            return
-
-        if pre_load_parquet:
-            if not bootstrap_source:
-                yield {
-                    "type": "error",
-                    "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
-                }
-                yield {
-                    "type": "done",
-                    "success": False,
-                    "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
-                    "execution_time_ms": 0,
-                    "context_id": context_id,
-                    "timed_out": False,
-                }
-                return
-            await self._ensure_materialized_pre_load_parquet(
-                record.info.container_id,
-                pre_load_parquet,
-            )
-
-        executor = CodeExecutor(self._docker_client)
-        async for event in executor.stream_in_container(
-            container_id=record.info.container_id,
-            code=code,
-            timeout=timeout,
-            bootstrap_source=bootstrap_source,
-            context_id=context_id,
-        ):
-            yield event
-
-    async def _materialize_pre_load_parquet(
-        self,
-        container_id: str,
-        pre_load_parquet: Dict[str, str],
-    ) -> None:
-        """把 ``{ref: base64}`` 解码后写入容器 ``/data/<ref>.parquet``。
-
-        见 executor_protocol_multitable.md §"Server-Side Handler Requirements"：
-        - 解码失败 → 抛 ``InternalError``，调用方负责包装成错误响应；
-        - 目录需要先确保存在（容器启动时已经 mkdir /data，但无状态 temp
-          容器场景下也一并处理）；
-        - 优先走 put_archive，失败回退到分块 echo+base64（复用
-          :meth:`_inject_data_files` 的同款策略）。
-        """
-        import base64 as _b64
-        import tarfile
-        import io
-
-        if not pre_load_parquet:
-            return
-
-        # 先确保 /data 目录存在（对无状态临时容器而言）
-        try:
-            await self._docker_client.exec_command(
-                container_id,
-                "mkdir -p /data",
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-        # 收集解码结果（把失败放在落盘之前抛出，避免只写了一部分）
-        decoded: Dict[str, bytes] = {}
-        for ref, b64_content in pre_load_parquet.items():
-            safe_ref = os.path.basename(ref)
-            if not safe_ref or safe_ref != ref:
-                raise InternalError(
-                    message=f"pre_load_parquet: invalid table_ref {ref!r}"
-                )
-            try:
-                decoded[safe_ref] = _b64.b64decode(b64_content)
-            except Exception as e:
-                raise InternalError(
-                    message=f"pre_load_parquet: base64 decode failed for {ref}: {e}"
-                )
-
-        # [Phase 1 诊断] 写盘前：打印 container_id、ref 列表、字节数总和
-        sorted_refs = sorted(decoded.keys())
-        total_bytes = sum(len(raw) for raw in decoded.values())
-        short_cid = container_id[:12] if container_id else ""
-        logger.info(
-            f"[SandboxManager.materialize_pre_load] pre-write "
-            f"container={short_cid} refs={sorted_refs} "
-            f"total_bytes={total_bytes}"
-        )
-
-        async def _log_data_dir_listing() -> None:
-            """[Phase 1 诊断] 写盘后：通过 docker exec ls /data 读取目录内容。"""
-            try:
-                ls_result = await self._docker_client.exec_command(
-                    container_id,
-                    "ls /data",
-                    timeout=5,
-                )
-                # 把多行输出压成单行便于 grep
-                data_listing = ls_result.stdout.strip().replace("\n", " ")
-                logger.info(
-                    f"[SandboxManager.materialize_pre_load] post-write "
-                    f"container={short_cid} /data={data_listing!r}"
-                )
-            except Exception as err:
-                logger.info(
-                    f"[SandboxManager.materialize_pre_load] post-write "
-                    f"container={short_cid} /data=<exec_failed: {err}>"
-                )
-
-        # 优先 put_archive
-        try:
-            tar_stream = io.BytesIO()
-            with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-                for ref, raw in decoded.items():
-                    info = tarfile.TarInfo(name=f"{ref}.parquet")
-                    info.size = len(raw)
-                    info.mode = 0o644
-                    info.uid = 1000
-                    info.gid = 1000
-                    tar.addfile(info, io.BytesIO(raw))
-            tar_stream.seek(0)
-            await self._docker_client.put_archive(
-                container_id, "/data", tar_stream.read()
-            )
-            logger.debug(
-                f"[pre_load_parquet] put_archive 写入 {len(decoded)} 张表 -> {short_cid}"
-            )
-            await _log_data_dir_listing()
-            return
-        except Exception as e:
-            logger.warning(
-                f"[pre_load_parquet] put_archive 失败，回退 echo+base64: "
-                f"container={short_cid} error={e!r}"
-            )
-
-        # 回退 echo+base64
-        # Docker exec 通过 shell 传超长 echo 命令时在部分 Docker Desktop/
-        # named-pipe 场景会偶发失败；把 chunk 控制在更保守的长度。
-        RAW_CHUNK_SIZE = 8192
-        for ref, raw in decoded.items():
-            target = f"/data/{ref}.parquet"
-            for i in range(0, len(raw), RAW_CHUNK_SIZE):
-                chunk = raw[i:i + RAW_CHUNK_SIZE]
-                b64_chunk = _b64.b64encode(chunk).decode("ascii")
-                op = ">" if i == 0 else ">>"
-                result = await self._docker_client.exec_command(
-                    container_id,
-                    f"echo '{b64_chunk}' | base64 -d {op} {target}",
-                    timeout=30,
-                )
-                if result.exit_code != 0:
-                    raise InternalError(
-                        message=(
-                            f"[pre_load_parquet] chunk write failed ref={ref} "
-                            f"chunk={i // RAW_CHUNK_SIZE} exit={result.exit_code} "
-                            f"stdout={result.stdout!r} stderr={result.stderr!r}"
-                        )
-                    )
-        await _log_data_dir_listing()
-
-    async def _data_dir_has_materialized_parquet(self, container_id: str) -> bool:
-        """Return whether the container currently exposes any parquet under /data."""
-        try:
-            result = await self._docker_client.exec_command(
-                container_id,
-                "sh -lc \"ls /data/*.parquet >/dev/null 2>/dev/null\"",
-                timeout=5,
-            )
-        except Exception as err:
-            logger.info(
-                "[SandboxManager.pre_load_health] container=%s parquet_check_failed=%r",
-                container_id[:12],
-                err,
-            )
-            return False
-
-        has_parquet = result.exit_code == 0
-        logger.info(
-            "[SandboxManager.pre_load_health] container=%s has_parquet=%s",
-            container_id[:12],
-            has_parquet,
-        )
-        return has_parquet
-
-    async def _ensure_materialized_pre_load_parquet(
-        self,
-        container_id: str,
-        pre_load_parquet: Dict[str, str],
-    ) -> None:
-        """Check /data first and only re-materialize parquet when the container is empty."""
-        if not pre_load_parquet:
-            return
-
-        if await self._data_dir_has_materialized_parquet(container_id):
-            return
-
-        logger.info(
-            "[SandboxManager.pre_load_health] container=%s /data empty -> materialize_pre_load_parquet",
-            container_id[:12],
-        )
-        await self._materialize_pre_load_parquet(container_id, pre_load_parquet)
-
-    async def execute_stateless(
-        self,
-        code: str,
-        data_files: Optional[Dict[str, str]] = None,
-        timeout: int = 30,
-        pre_load_parquet: Optional[Dict[str, str]] = None,
-        bootstrap_source: Optional[str] = None,
-        context_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        无状态执行：借容器 → 注入数据 → 执行代码 → 清理 → 归还容器。
-
-        容器不与任何 session 绑定，执行完毕立即归还池，实现快速轮转。
-
-        multi-table-analysis: 支持 ``pre_load_parquet`` + ``bootstrap_source``
-        契约（见 executor_protocol_multitable.md）。若两者都提供，沙箱会：
-        1) 先把 ``{ref: base64(parquet)}`` 落到容器 ``/data/<ref>.parquet``；
-        2) 在 user code *之前* exec ``bootstrap_source``，由它按 TableRef
-                context_id=context_id,
-
-        Args:
-            code: Python 代码
-            data_files: 数据文件字典 {filename: base64_content}
-            timeout: 执行超时（秒）
-            pre_load_parquet: {TableRef: base64(parquet bytes)}（可选，多表分析）
-            bootstrap_source: DataLoaderBootstrap 源码（可选，多表分析）
-            context_id: 内核上下文 ID（可选）
-
-        Returns:
-            执行结果字典（与 execute_code 格式一致）
-        """
-        from ..executor import CodeExecutor
-
-        if pre_load_parquet and not bootstrap_source:
-            return {
-                "success": False,
-                "output": "",
-                "stdout": "",
-                "stderr": "pre_load_parquet provided without bootstrap_source",
-                "charts": [],
-                "tables": [],
-                "images": [],
-                "error": "ProtocolError: pre_load_parquet requires bootstrap_source",
-                "execution_time_ms": 0,
-            }
-
-        if not self._container_pool:
-            raise InternalError(message="容器池未初始化")
-
-        # 1. 从池中借一个容器
-        pooled = await self._container_pool.acquire_for_execution()
-        if not pooled:
-            # 池空，回退到创建临时容器
-            logger.warning("容器池为空，创建临时容器执行")
-            return await self._execute_stateless_with_temp_container(
-                code,
-                data_files,
-                timeout,
-                pre_load_parquet=pre_load_parquet,
-                bootstrap_source=bootstrap_source,
-                context_id=context_id,
-            )
-
-        container_id = pooled.container_id
-        try:
-            # 2. 注入数据文件
-            if data_files:
-                await self._inject_data_files(container_id, data_files)
-            if pre_load_parquet:
-                await self._ensure_materialized_pre_load_parquet(
-                    container_id,
-                    pre_load_parquet,
-                )
-
-            # 3. 执行代码
-            executor = CodeExecutor(self._docker_client)
-            result = await executor.execute_in_container(
-                container_id=container_id,
-                code=code,
-                data_dir="/data",
-                output_dir="/output",
-                timeout=timeout,
-                bootstrap_source=bootstrap_source,
-                context_id=context_id,
-            )
-
-            cleanup_ok = (
-                False
-                if result.get("kernel_unhealthy")
-                else await self._cleanup_and_reset_for_reuse(container_id)
-            )
-            await self._release_or_destroy_stateless_container(container_id, cleanup_ok)
-
-            return result
-
-        except Exception as e:
-            logger.error(f"无状态执行失败: {e}, 容器: {container_id[:12]}")
-            cleanup_ok = await self._cleanup_and_reset_for_reuse(container_id)
-            await self._release_or_destroy_stateless_container(container_id, cleanup_ok)
-            raise
-
-    async def _execute_stateless_with_temp_container(
-        self,
-        code: str,
-        data_files: Optional[Dict[str, str]],
-        timeout: int,
-        pre_load_parquet: Optional[Dict[str, str]] = None,
-        bootstrap_source: Optional[str] = None,
-        context_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """池空时创建临时容器执行，执行完销毁。"""
-        from ..executor import CodeExecutor
-
-        resource_limits = self._resource_limiter.get_limits()
-        resource_kwargs = resource_limits.to_container_create_kwargs()
-        security_kwargs = self._security_policy.to_docker_config()
-        security_kwargs.pop("pids_limit", None)
-        security_kwargs.pop("privileged", None)
-
-        # 无状态容器没有 volume 挂载，需要将 /data 和 /output 也加入 tmpfs
-        tmpfs_config = self._security_policy.get_tmpfs_config()
-        tmpfs_config["/data"] = "size=500M,mode=1777,uid=1000,gid=1000"
-        tmpfs_config["/output"] = "size=500M,mode=1777,uid=1000,gid=1000"
-        tmpfs_config["/var/cache/fontconfig"] = "size=10M,mode=1777,uid=1000,gid=1000"
-
-        container_info = await self._docker_client.create_container(
-            image=self._docker_image,
-            detach=True,
-            network_mode="none",
-            tmpfs=tmpfs_config,
-            **resource_kwargs,
-            **security_kwargs,
-        )
-        container_id = container_info.container_id
-        await self._docker_client.start_container(container_id)
-
-        try:
-            if data_files:
-                await self._inject_data_files(container_id, data_files)
-            if pre_load_parquet:
-                await self._ensure_materialized_pre_load_parquet(
-                    container_id,
-                    pre_load_parquet,
-                )
-
-            executor = CodeExecutor(self._docker_client)
-            result = await executor.execute_in_container(
-                container_id=container_id,
-                code=code,
-                data_dir="/data",
-                output_dir="/output",
-                timeout=timeout,
-                bootstrap_source=bootstrap_source,
-                context_id=context_id,
-            )
-            return result
-        finally:
-            try:
-                await self._docker_client.stop_container(container_id, timeout=5)
-                await self._docker_client.remove_container(container_id, force=True)
-            except Exception as e:
-                logger.warning(f"清理临时容器失败: {e}")
-
-    async def _cleanup_and_reset_for_reuse(self, container_id: str) -> bool:
-        try:
-            await self._cleanup_container_workspace(container_id)
-            return await self._reset_kernel_namespace(container_id)
-        except Exception as e:
-            logger.warning(f"容器 {container_id[:12]} 清理或重置失败: {e}")
-            return False
-
-    async def _release_or_destroy_stateless_container(
-        self, container_id: str, reusable: bool
-    ) -> None:
-        if reusable:
-            await self._container_pool.release(container_id)
-            return
-        logger.warning(f"容器 {container_id[:12]} 不可安全复用，销毁并补池")
-        try:
-            await self._docker_client.stop_container(container_id, timeout=5)
-            await self._docker_client.remove_container(container_id, force=True)
-        except Exception as e:
-            logger.warning(f"销毁不可复用容器失败: {container_id[:12]}, {e}")
-        asyncio.create_task(self._container_pool.replenish())
-
-    async def _inject_data_files(
-        self, container_id: str, data_files: Dict[str, str]
-    ) -> None:
-        """
-        将 base64 编码的数据文件注入容器的 /data 目录。
-
-        优先使用 Docker put_archive API（单次 tar 传输，零 Base64 分块损耗）；
-        如果 put_archive 失败，回退到分块 echo+base64。
-
-        Args:
-            container_id: 容器 ID
-            data_files: {filename: base64_content}
-        """
-        import base64 as b64
-        import tarfile
-        import io
-
-        logger.info(f"[数据注入] 开始注入 {len(data_files)} 个文件到容器 {container_id[:12]}")
-        for fname in data_files.keys():
-            logger.info(f"[数据注入] 文件: {fname}, base64长度: {len(data_files[fname])}")
-
-        await self._docker_client.exec_command(
-            container_id,
-            "find /data -mindepth 1 -maxdepth 1 -type f -delete",
-            timeout=10,
-        )
-
-        # --- 优先方案：将所有文件打包为 tar 一次性传输 ---
-        try:
-            tar_stream = io.BytesIO()
-            total_size = 0
-            file_count = 0
-
-            with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-                for filename, b64_content in data_files.items():
-                    safe_name = os.path.basename(filename)
-                    if not safe_name:
-                        continue
-
-                    try:
-                        raw_data = b64.b64decode(b64_content)
-                    except Exception as e:
-                        logger.warning(f"解码数据文件失败: {safe_name}, {e}")
-                        continue
-
-                    info = tarfile.TarInfo(name=safe_name)
-                    info.size = len(raw_data)
-                    info.mode = 0o644
-                    info.uid = 1000
-                    info.gid = 1000
-                    tar.addfile(info, io.BytesIO(raw_data))
-                    total_size += len(raw_data)
-                    file_count += 1
-
-            tar_stream.seek(0)
-
-            await self._docker_client.put_archive(
-                container_id, "/data", tar_stream.read()
-            )
-
-            logger.debug(
-                f"put_archive 注入 {file_count} 个数据文件 "
-                f"({total_size} bytes) -> {container_id[:12]}"
-            )
-            return
-
-        except Exception as e:
-            logger.debug(f"put_archive 不可用（预期行为：只读 rootfs），使用 echo+base64: {e}")
-
-        # --- 回退方案：分块 echo+base64 ---
-        RAW_CHUNK_SIZE = 24576
-
-        for filename, b64_content in data_files.items():
-            safe_name = os.path.basename(filename)
-            if not safe_name:
-                continue
-
-            target_path = f"/data/{safe_name}"
-
-            try:
-                raw_data = b64.b64decode(b64_content)
-            except Exception as e:
-                logger.warning(f"解码数据文件失败: {safe_name}, {e}")
-                continue
-
-            for i in range(0, len(raw_data), RAW_CHUNK_SIZE):
-                chunk = raw_data[i:i + RAW_CHUNK_SIZE]
-                b64_chunk = b64.b64encode(chunk).decode('ascii')
-                op = '>' if i == 0 else '>>'
-                result = await self._docker_client.exec_command(
-                    container_id,
-                    f"echo '{b64_chunk}' | base64 -d {op} {target_path}",
-                    timeout=30,
-                )
-                if result.exit_code != 0:
-                    logger.error(
-                        f"写入数据文件分块失败: {safe_name}, "
-                        f"chunk {i // RAW_CHUNK_SIZE}, "
-                        f"exit={result.exit_code}, stderr={result.stderr}"
-                    )
-                    break
-
-            logger.debug(
-                f"echo+base64 注入数据文件: {safe_name} ({len(raw_data)} bytes, "
-                f"{(len(raw_data) - 1) // RAW_CHUNK_SIZE + 1} chunks) "
-                f"-> {container_id[:12]}"
-            )
-
-    async def _cleanup_container_workspace(self, container_id: str) -> None:
-        """
-        清理容器内所有可写挂载点的内容，为下次复用做准备。
-
-        覆盖 /data, /output, /tmp, /var/tmp, /run, /home/sandbox 等
-        tmpfs 和 bind-mount 目录，防止跨用户数据泄漏。
-
-        Args:
-            container_id: 容器 ID
-        """
-        try:
-            is_running = await self._docker_client.is_container_running(container_id)
-            if not is_running:
-                logger.warning(f"容器未运行，跳过清理: {container_id[:12]}")
-                raise InternalError(message=f"容器 {container_id[:12]} 未运行")
-        except InternalError:
-            raise
-        except Exception as e:
-            logger.warning(f"检查容器状态失败: {container_id[:12]}, {e}")
-            raise
-
-        cleanup_cmd = (
-            "find /data -mindepth 1 -delete 2>/dev/null; "
-            "find /output -mindepth 1 -delete 2>/dev/null; "
-            "find /tmp -mindepth 1 -delete 2>/dev/null; "
-            "find /var/tmp -mindepth 1 -delete 2>/dev/null; "
-            "find /run -mindepth 1 -delete 2>/dev/null; "
-            "find /home/sandbox -mindepth 1 -delete 2>/dev/null; "
-            "true"
-        )
-        cleanup_timeout = settings.fire_and_forget.cleanup_timeout
-        try:
-            result = await self._docker_client.exec_command(
-                container_id, cleanup_cmd, timeout=cleanup_timeout
-            )
-            logger.info(
-                f"容器工作空间已清理: {container_id[:12]}, "
-                f"exit_code={result.exit_code}, "
-                f"清理目录: /data, /output, /tmp, /var/tmp, /run, /home/sandbox"
-            )
-        except Exception as e:
-            logger.warning(f"清理容器工作空间失败: {container_id[:12]}, {e}")
-            raise InternalError(message=f"清理容器工作空间失败: {str(e)}", original_error=e)
-
-    async def _reset_kernel_namespace(self, container_id: str) -> bool:
-        """
-        Reset the Kernel Server namespace inside the container to prevent
-        cross-user variable leakage in stateless execution mode.
-
-        Sends a reset request via kernel_relay. Returns False on failure so
-        callers can avoid returning a contaminated container to the pool.
-        """
-        try:
-            reset_cmd = (
-                'python -c "'
-                "import socket,json;"
-                "s=socket.socket();"
-                "s.connect(('127.0.0.1',9999));"
-                "p=json.dumps({'action':'reset'}).encode();"
-                "s.sendall(len(p).to_bytes(4,'big')+p);"
-                "s.recv(4096);"
-                "s.close()"
-                '"'
-            )
-            result = await self._docker_client.exec_command(
-                container_id, reset_cmd, timeout=10
-            )
-            if result.exit_code == 0:
-                logger.debug(f"Kernel namespace reset: {container_id[:12]}")
-                return True
-            else:
-                logger.warning(
-                    f"Kernel namespace reset failed: {container_id[:12]}, "
-                    f"exit={result.exit_code}"
-                )
-                return False
-        except Exception as e:
-            logger.warning(f"Kernel namespace reset error: {container_id[:12]}, {e}")
-            return False
 
     async def list_sandboxes(
         self,
@@ -1309,47 +485,47 @@ class SandboxManager:
     ) -> List[SandboxInfo]:
         """
         列出沙箱
-        
+
         Args:
             state: 按状态过滤（可选）
             limit: 返回数量限制
             offset: 偏移量
-            
+
         Returns:
             SandboxInfo 列表
         """
         async with self._lock:
             # 获取所有沙箱
             sandboxes = list(self._sandboxes.values())
-        
+
         # 更新状态
         for record in sandboxes:
             await self._update_sandbox_state(record)
-        
+
         # 按状态过滤
         if state is not None:
             sandboxes = [s for s in sandboxes if s.info.state == state]
-        
+
         # 按创建时间排序（最新的在前）
         sandboxes.sort(key=lambda s: s.info.created_at, reverse=True)
-        
+
         # 分页
         sandboxes = sandboxes[offset:offset + limit]
-        
+
         return [s.info for s in sandboxes]
 
     async def get_resource_usage(self, sandbox_id: str) -> ResourceUsage:
         """
         获取沙箱资源使用情况
-        
+
         Requirements: 1.3 (查询沙箱状态 - 资源使用情况)
-        
+
         Args:
             sandbox_id: 沙箱 ID
-            
+
         Returns:
             ResourceUsage 对象
-            
+
         Raises:
             SandboxNotFoundError: 沙箱不存在
         """
@@ -1357,16 +533,16 @@ class SandboxManager:
             record = self._sandboxes.get(sandbox_id)
             if record is None:
                 raise SandboxNotFoundError(sandbox_id=sandbox_id)
-        
+
         return await self._resource_limiter.get_usage(record.info.container_id)
-    
+
     async def update_activity(self, sandbox_id: str) -> None:
         """
         更新沙箱活动时间
-        
+
         Args:
             sandbox_id: 沙箱 ID
-            
+
         Raises:
             SandboxNotFoundError: 沙箱不存在
         """
@@ -1374,29 +550,29 @@ class SandboxManager:
             record = self._sandboxes.get(sandbox_id)
             if record is None:
                 raise SandboxNotFoundError(sandbox_id=sandbox_id)
-            
+
             record.info.last_activity = datetime.now()
-    
+
     async def get_statistics(self) -> Dict[str, Any]:
         """
         获取沙箱管理器统计信息
-        
+
         Returns:
             统计信息字典
         """
         async with self._lock:
             active_count = len(self._sandboxes)
-            
+
             # 按状态统计
             state_counts = {}
             for record in self._sandboxes.values():
                 state = record.info.state.value
                 state_counts[state] = state_counts.get(state, 0) + 1
-        
+
         pool_stats = {}
         if self._container_pool:
             pool_stats = self._container_pool.statistics
-        
+
         return {
             "active_sandboxes": active_count,
             "max_concurrent": self._max_concurrent,
@@ -1408,23 +584,23 @@ class SandboxManager:
         }
 
     # ==================== 私有方法 ====================
-    
+
     def _generate_sandbox_id(self) -> str:
         """
         生成唯一的沙箱 ID
-        
+
         Returns:
             沙箱 ID 字符串
         """
         return f"sandbox-{uuid.uuid4().hex[:12]}"
-    
+
     def _create_workspace_dirs(self, session_id: str) -> tuple[str, str, bool]:
         """
         创建沙箱工作空间目录
-        
+
         Args:
             session_id: 会话 ID
-            
+
         Returns:
             (data_dir, output_dir, data_dir_readonly) 元组
         """
@@ -1436,133 +612,19 @@ class SandboxManager:
             data_dir = os.path.join(shared_data_root, session_id)
         else:
             data_dir = os.path.join(workspace_dir, "data")
-        
+
         os.makedirs(data_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
-        
+
         logger.debug(f"创建工作空间目录: {workspace_dir}")
         return data_dir, output_dir, data_dir_readonly
-    
-    async def _create_container(
-        self,
-        sandbox_id: str,
-        resource_limits: ResourceLimits,
-        network_policy: NetworkPolicy,
-        data_dir: str,
-        output_dir: str,
-        data_dir_readonly: bool = False,
-    ) -> str:
-        """
-        创建沙箱容器
-        
-        Args:
-            sandbox_id: 沙箱 ID
-            resource_limits: 资源限制配置
-            network_policy: 网络策略
-            data_dir: 数据目录路径
-            output_dir: 输出目录路径
-            
-        Returns:
-            容器 ID
-        """
-        # 获取资源限制参数
-        resource_kwargs = resource_limits.to_container_create_kwargs()
-        
-        # 获取安全策略参数
-        security_kwargs = self._security_policy.to_docker_config()
-        
-        # 移除安全策略中的 pids_limit，使用资源限制中的值
-        # 避免参数重复
-        security_kwargs.pop("pids_limit", None)
-        
-        # 获取 tmpfs 配置
-        tmpfs_config = self._security_policy.get_tmpfs_config()
-        
-        # 获取网络模式
-        network_mode = self._network_controller.get_network_mode_for_container(network_policy)
-        
-        # 卷挂载配置
-        volumes = {
-            data_dir: {"bind": "/data", "mode": "ro" if data_dir_readonly else "rw"},
-            output_dir: {"bind": "/output", "mode": "rw"},
-        }
-        
-        # 容器标签
-        labels = {
-            self.SANDBOX_LABEL_KEY: self.SANDBOX_LABEL_VALUE,
-            "sandbox.id": sandbox_id,
-            "sandbox.created_at": datetime.now().isoformat(),
-        }
-        
-        # gVisor 运行时配置
-        runtime = None
-        if settings.security.use_gvisor:
-            runtime = settings.security.gvisor_runtime
-            logger.info(f"使用 gVisor 运行时: {runtime}")
-        
-        # 创建容器
-        container_info = await self._docker_client.create_container(
-            image=self._docker_image,
-            name=f"sandbox-{sandbox_id[:8]}",
-            command=None,  # 使用 Dockerfile CMD（kernel_server）
-            labels=labels,
-            volumes=volumes,
-            network_mode=network_mode,
-            tmpfs=tmpfs_config,
-            working_dir="/home/sandbox",
-            runtime=runtime,  # gVisor 支持
-            **resource_kwargs,
-            **security_kwargs,
-        )
-        
-        # 启动容器
-        await self._docker_client.start_container(container_info.container_id)
-        
-        # 如果需要网络，连接到隔离网络
-        if network_policy.enabled and network_policy.allow_outbound:
-            await self._network_controller.connect_container(
-                container_info.container_id,
-                network_policy
-            )
-        
-        return container_info.container_id
-    
-    def _get_pool_container_config(self) -> Dict[str, Any]:
-        """
-        获取容器池的容器配置
-        
-        Returns:
-            容器配置字典
-        """
-        # 使用默认资源限制
-        resource_limits = self._resource_limiter.get_limits()
-        resource_kwargs = resource_limits.to_container_create_kwargs()
-        
-        # 使用默认安全策略
-        security_kwargs = self._security_policy.to_docker_config()
-        # DockerClient.create_container 不接受 privileged 参数
-        security_kwargs.pop("privileged", None)
-
-        # 池容器用于无状态执行，没有 volume 挂载
-        # 需要将 /data 和 /output 也加入 tmpfs 使其可写
-        tmpfs_config = self._security_policy.get_tmpfs_config()
-        tmpfs_config["/data"] = "size=500M,mode=1777,uid=1000,gid=1000"
-        tmpfs_config["/output"] = "size=500M,mode=1777,uid=1000,gid=1000"
-        tmpfs_config["/var/cache/fontconfig"] = "size=10M,mode=1777,uid=1000,gid=1000"
-
-        return {
-            **resource_kwargs,
-            **security_kwargs,
-            "tmpfs": tmpfs_config,
-            "network_mode": "none",  # 预热容器默认无网络
-        }
 
     async def _update_sandbox_state(self, record: _SandboxRecord) -> None:
         """
         更新沙箱状态
-        
+
         根据容器实际状态更新沙箱信息。
-        
+
         Args:
             record: 沙箱记录
         """
@@ -1570,7 +632,7 @@ class SandboxManager:
             container_info = await self._docker_client.get_container_status(
                 record.info.container_id
             )
-            
+
             # 映射容器状态到沙箱状态
             state_mapping = {
                 ContainerState.CREATED: SandboxState.CREATING,
@@ -1581,29 +643,29 @@ class SandboxManager:
                 ContainerState.RESTARTING: SandboxState.CREATING,
                 ContainerState.UNKNOWN: SandboxState.ERROR,
             }
-            
+
             record.info.state = state_mapping.get(
                 container_info.state,
                 SandboxState.ERROR
             )
-            
+
         except Exception as e:
             logger.warning(f"更新沙箱状态失败: {record.info.sandbox_id}, 错误: {e}")
             record.info.state = SandboxState.ERROR
-    
+
     async def _cleanup_sandbox_resources(self, session_id: str) -> None:
         """
         清理沙箱资源
-        
+
         删除沙箱的工作空间目录，包括数据目录和输出目录中的所有文件。
-        
+
         Requirements 5.6: 沙箱销毁时清理所有关联的文件
-        
+
         Args:
             session_id: 会话 ID
         """
         workspace_dir = os.path.join(self._workspace_base, session_id)
-        
+
         if os.path.exists(workspace_dir):
             try:
                 shutil.rmtree(workspace_dir)
@@ -1614,45 +676,45 @@ class SandboxManager:
     async def _cleanup_loop(self) -> None:
         """
         后台清理循环
-        
+
         定期检查并清理空闲超时的沙箱。
         Requirements 1.2: 沙箱空闲超过配置的超时时间时自动销毁
         """
         logger.info("启动沙箱清理循环")
-        
+
         check_interval = 60  # 每 60 秒检查一次
-        
+
         while self._running:
             try:
                 await asyncio.sleep(check_interval)
-                
+
                 if not self._running:
                     break
-                
+
                 await self._cleanup_idle_sandboxes()
-                
+
             except asyncio.CancelledError:
                 logger.debug("清理循环被取消")
                 break
             except Exception as e:
                 logger.error(f"清理循环出错: {e}")
                 await asyncio.sleep(5)
-        
+
         logger.info("沙箱清理循环已停止")
-    
+
     async def _cleanup_idle_sandboxes(self) -> None:
         """
         清理空闲超时的沙箱
-        
+
         Requirements 1.2: 沙箱空闲超过配置的超时时间时自动销毁
         """
         now = datetime.now()
         sandboxes_to_destroy: List[str] = []
-        
+
         async with self._lock:
             for sandbox_id, record in self._sandboxes.items():
                 idle_seconds = (now - record.info.last_activity).total_seconds()
-                
+
                 if idle_seconds > record.timeout_seconds:
                     logger.info(
                         f"沙箱空闲超时: {sandbox_id}, "
@@ -1660,35 +722,43 @@ class SandboxManager:
                         f"超时配置: {record.timeout_seconds}s"
                     )
                     sandboxes_to_destroy.append(sandbox_id)
-        
+
         # 销毁超时的沙箱
         for sandbox_id in sandboxes_to_destroy:
             try:
                 await self.destroy_sandbox(sandbox_id)
             except Exception as e:
                 logger.error(f"清理超时沙箱失败: {sandbox_id}, 错误: {e}")
-        
+
         if sandboxes_to_destroy:
             logger.info(f"清理了 {len(sandboxes_to_destroy)} 个空闲超时的沙箱")
 
     async def _cleanup_stale_sandboxes(self) -> None:
         """
         清理可能存在的旧沙箱容器
-        
+
         在初始化时清理之前运行遗留的沙箱容器。
         """
         try:
-            # 查找带有沙箱标签的容器
+            # 只清理本实例的旧沙箱容器（多实例共享 daemon 时不误删兄弟实例的）
+            from ..config import resolve_instance_id
+
+            instance_id = resolve_instance_id()
             containers = await self._docker_client.list_containers(
                 all=True,
                 filters={
-                    "label": f"{self.SANDBOX_LABEL_KEY}={self.SANDBOX_LABEL_VALUE}"
+                    "label": [
+                        f"{self.SANDBOX_LABEL_KEY}={self.SANDBOX_LABEL_VALUE}",
+                        f"{self.INSTANCE_LABEL_KEY}={instance_id}",
+                    ]
                 }
             )
-            
+
             if containers:
-                logger.info(f"发现 {len(containers)} 个旧沙箱容器，正在清理...")
-                
+                logger.info(
+                    f"发现 {len(containers)} 个本实例（{instance_id}）旧沙箱容器，正在清理..."
+                )
+
                 for container in containers:
                     try:
                         await self._docker_client.remove_container(
@@ -1698,17 +768,17 @@ class SandboxManager:
                         logger.debug(f"清理旧容器: {container.container_id[:12]}")
                     except Exception as e:
                         logger.warning(f"清理旧容器失败: {e}")
-                
+
                 logger.info("旧沙箱容器清理完成")
-                
+
         except Exception as e:
             logger.warning(f"清理旧沙箱容器时出错: {e}")
-    
+
     async def __aenter__(self) -> "SandboxManager":
         """异步上下文管理器入口"""
         await self.initialize()
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """异步上下文管理器出口"""
         await self.shutdown()

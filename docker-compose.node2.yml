@@ -1,0 +1,85 @@
+# 第二个 KernelDock 节点（单机模拟多节点集群，用于分布式 e2e 测试）
+#
+# 与主 compose 完全独立的 project：
+#   docker compose -p kd-node2 -f docker-compose.node2.yml up -d
+# 监听 9528；与 node1 共享同一个 Docker daemon 和沙箱镜像。
+
+services:
+  docker-socket-proxy-2:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: kerneldock-socket-proxy-2
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - CONTAINERS=1
+      - POST=1
+      - ALLOW_START=1
+      - ALLOW_STOP=1
+      - ALLOW_RESTARTS=0
+      - EXEC=1
+      - IMAGES=1
+      - NETWORKS=1
+      - VOLUMES=1
+      - INFO=1
+      - PING=1
+      - VERSION=1
+      - BUILD=0
+      - COMMIT=0
+      - SWARM=0
+      - SYSTEM=0
+    networks:
+      - kd2-internal
+
+  kerneldock-2:
+    image: kerneldock:latest
+    container_name: kerneldock-2
+    depends_on:
+      - docker-socket-proxy-2
+    ports:
+      - "9528:8080"
+    volumes:
+      - kd2_workspace:/workspace
+    networks:
+      - kd2-internal
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKSPACE_DIR=/workspace
+      - SANDBOX_DOCKER_SOCKET=tcp://docker-socket-proxy-2:2375
+      - SANDBOX_KERNEL_TRANSPORT=direct
+      - SANDBOX_DOCKER_IMAGE=${SANDBOX_DOCKER_IMAGE:-kerneldock-sandbox:v2.0.0}
+      - SANDBOX_RESOURCE__DEFAULT_CPU=1.0
+      - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=512
+      - SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS=16
+      - SANDBOX_POOL__POOL_SIZE=1
+      - SANDBOX_POOL__MIN_POOL_SIZE=1
+      - SANDBOX_POOL__MAX_POOL_SIZE=2
+      - SANDBOX_POOL__SHARED_STATELESS=true
+      - SANDBOX_POOL__SHARED_MAX_PER_CONTAINER=4
+      - SANDBOX_NETWORK__EGRESS_MODE=${SANDBOX_NETWORK__EGRESS_MODE:-none}
+      - SANDBOX_NETWORK__EGRESS_PROXY_URL=${SANDBOX_NETWORK__EGRESS_PROXY_URL:-http://kerneldock-egress-proxy:8888}
+      - SANDBOX_VALIDATION_MODE=warn
+      - SANDBOX_ALLOW_LOCAL_FALLBACK=false
+      # 分布式自注册（Phase 2 e2e 用）：
+      # NODE2_ROUTER_URL=http://host.docker.internal:9500 即自动入集群
+      - ROUTER_URL=${NODE2_ROUTER_URL:-}
+      - NODE_NAME=${NODE2_NAME:-n2}
+      - NODE_ADVERTISE_URL=${NODE2_ADVERTISE_URL:-http://localhost:9528}
+      - ROUTER_ADMIN_TOKEN=${ROUTER_ADMIN_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  kd2-internal:
+    driver: bridge
+
+volumes:
+  kd2_workspace:
+    driver: local

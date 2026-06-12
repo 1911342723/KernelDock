@@ -4,17 +4,15 @@
 管理沙箱会话状态和元数据，支持会话创建、查询、更新、删除和过期清理。
 使用内存存储实现，适用于单实例部署场景。
 
-Requirements:
-- 8.1: 生成唯一的会话 ID 并关联到沙箱
-- 8.2: 存储会话的元数据（创建时间、最后活动时间、数据文件列表）
-- 8.3: 会话超过配置的最大空闲时间时标记为过期
-- 8.4: 支持通过会话 ID 恢复之前的沙箱状态
-- 8.5: 提供会话列表查询接口，支持分页
 """
 
 import asyncio
+import json
 import logging
+import os
+import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -121,12 +119,6 @@ class SessionStore:
     管理沙箱会话状态和元数据，提供会话的 CRUD 操作和过期清理功能。
     使用内存字典存储会话数据，适用于单实例部署。
     
-    Requirements:
-    - 8.1: 生成唯一的会话 ID 并关联到沙箱
-    - 8.2: 存储会话的元数据
-    - 8.3: 会话过期检测
-    - 8.4: 通过会话 ID 恢复沙箱状态
-    - 8.5: 分页查询接口
     
     Attributes:
         max_idle_seconds: 最大空闲时间（秒），默认 3600（1小时）
@@ -136,7 +128,8 @@ class SessionStore:
     def __init__(
         self,
         max_idle_seconds: int = 3600,
-        max_session_seconds: int = 43200
+        max_session_seconds: int = 43200,
+        db_path: Optional[str] = None,
     ):
         """
         初始化会话存储
@@ -144,20 +137,113 @@ class SessionStore:
         Args:
             max_idle_seconds: 最大空闲时间（秒），默认 1 小时
             max_session_seconds: 最大会话时长（秒），默认 12 小时
+            db_path: SQLite 持久化文件路径；为 None 时仅用内存存储
+                （网关重启会丢失全部会话元数据）
         """
         self._max_idle_seconds = max_idle_seconds
         self._max_session_seconds = max_session_seconds
         
-        # 内存存储：session_id -> SessionInfo
+        # 内存存储：session_id -> SessionInfo（读路径，SQLite 仅作 write-through）
         self._sessions: Dict[str, SessionInfo] = {}
         
         # 用于保护并发访问的锁
         self._lock = asyncio.Lock()
+
+        # SQLite 持久化（可选）。运行时的写操作全部走单线程 executor，
+        # 既不阻塞事件循环（fsync 在慢盘是毫秒级停顿），又把连接的访问
+        # 串行化到同一线程（避免 check_same_thread=False 的并发隐患）。
+        self._db: Optional[sqlite3.Connection] = None
+        self._db_executor: Optional[ThreadPoolExecutor] = None
+        if db_path:
+            try:
+                os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+                self._db = sqlite3.connect(db_path, check_same_thread=False)
+                # WAL：读写不互斥、写放大更小，提升 write-through 吞吐
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=NORMAL")
+                self._db.execute(
+                    "CREATE TABLE IF NOT EXISTS sessions ("
+                    "session_id TEXT PRIMARY KEY, data TEXT NOT NULL)"
+                )
+                self._db.commit()
+                self._load_persisted_sessions()
+                self._db_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="session-store-db"
+                )
+                logger.info(f"会话 SQLite 持久化已启用: {db_path}")
+            except Exception as e:
+                logger.warning(f"会话持久化初始化失败，回退纯内存模式: {e}")
+                self._db = None
         
         logger.info(
             f"会话存储初始化完成: max_idle={max_idle_seconds}s, "
-            f"max_session={max_session_seconds}s"
+            f"max_session={max_session_seconds}s, "
+            f"persisted={'yes' if self._db else 'no'}"
         )
+
+    def _load_persisted_sessions(self) -> None:
+        """启动时从 SQLite 恢复未过期会话到内存。"""
+        assert self._db is not None
+        restored = 0
+        dropped = 0
+        for (session_id, data) in self._db.execute(
+            "SELECT session_id, data FROM sessions"
+        ).fetchall():
+            try:
+                session = SessionInfo.from_dict(json.loads(data))
+            except Exception:
+                dropped += 1
+                continue
+            if session.is_expired(self._max_idle_seconds, self._max_session_seconds):
+                dropped += 1
+                continue
+            # 网关重启后旧沙箱容器已不存在，清空绑定，待下次执行时重建
+            session.sandbox_id = None
+            self._sessions[session_id] = session
+            restored += 1
+        if dropped:
+            if self._sessions:
+                placeholders = ",".join("?" * len(self._sessions))
+                self._db.execute(
+                    f"DELETE FROM sessions WHERE session_id NOT IN ({placeholders})",
+                    list(self._sessions.keys()),
+                )
+            else:
+                self._db.execute("DELETE FROM sessions")
+            self._db.commit()
+        logger.info(f"会话恢复完成: restored={restored}, dropped={dropped}")
+
+    def _persist_sync(self, session_id: str, data: str) -> None:
+        try:
+            self._db.execute(
+                "INSERT OR REPLACE INTO sessions (session_id, data) VALUES (?, ?)",
+                (session_id, data),
+            )
+            self._db.commit()
+        except Exception as e:
+            logger.warning(f"会话持久化写入失败: {session_id}, {e}")
+
+    async def _persist(self, session: SessionInfo) -> None:
+        """write-through 持久化单个会话（offload 到单线程 executor，不阻塞事件循环）。"""
+        if self._db is None or self._db_executor is None:
+            return
+        data = json.dumps(session.to_dict(), ensure_ascii=False)
+        session_id = session.session_id
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._db_executor, self._persist_sync, session_id, data)
+
+    async def _delete_persisted(self, session_id: str) -> None:
+        if self._db is None or self._db_executor is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._db_executor, self._delete_persisted_sync, session_id)
+
+    def _delete_persisted_sync(self, session_id: str) -> None:
+        try:
+            self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            self._db.commit()
+        except Exception as e:
+            logger.warning(f"会话持久化删除失败: {session_id}, {e}")
     
     @property
     def max_idle_seconds(self) -> int:
@@ -222,6 +308,7 @@ class SessionStore:
             )
             
             self._sessions[session_id] = session
+            await self._persist(session)
             
             logger.info(f"创建会话: {session_id}")
             
@@ -281,6 +368,7 @@ class SessionStore:
                 return False
             
             session.last_activity = datetime.now(timezone.utc)
+            await self._persist(session)
             logger.debug(f"更新会话活动时间: {session_id}")
             
             return True
@@ -315,6 +403,7 @@ class SessionStore:
             
             session.sandbox_id = sandbox_id
             session.last_activity = datetime.now(timezone.utc)
+            await self._persist(session)
             logger.info(f"会话 {session_id} 关联沙箱: {sandbox_id}")
             
             return True
@@ -354,6 +443,7 @@ class SessionStore:
                 )
             
             session.last_activity = datetime.now(timezone.utc)
+            await self._persist(session)
             
             return True
     
@@ -385,6 +475,7 @@ class SessionStore:
             
             if filename in session.data_files:
                 session.data_files.remove(filename)
+                await self._persist(session)
                 logger.debug(
                     f"会话 {session_id} 移除数据文件: {filename}"
                 )
@@ -422,6 +513,7 @@ class SessionStore:
             
             session.metadata.update(metadata)
             session.last_activity = datetime.now(timezone.utc)
+            await self._persist(session)
             logger.debug(f"会话 {session_id} 更新元数据")
             
             return True
@@ -441,6 +533,7 @@ class SessionStore:
         async with self._lock:
             if session_id in self._sessions:
                 del self._sessions[session_id]
+                await self._delete_persisted(session_id)
                 logger.info(f"删除会话: {session_id}")
                 return True
             
@@ -511,6 +604,7 @@ class SessionStore:
             
             for session_id in expired_ids:
                 del self._sessions[session_id]
+                await self._delete_persisted(session_id)
                 logger.info(f"清理过期会话: {session_id}")
             
             if expired_ids:
@@ -557,8 +651,30 @@ class SessionStore:
         async with self._lock:
             count = len(self._sessions)
             self._sessions.clear()
+            if self._db is not None and self._db_executor is not None:
+                def _clear_all():
+                    try:
+                        self._db.execute("DELETE FROM sessions")
+                        self._db.commit()
+                    except Exception as e:
+                        logger.warning(f"清空持久化会话失败: {e}")
+
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(self._db_executor, _clear_all)
             logger.info(f"清除所有会话，共 {count} 个")
             return count
+
+    async def close(self) -> None:
+        """关闭会话存储：停止 DB 写线程并关闭连接（停机时调用）。"""
+        if self._db_executor is not None:
+            self._db_executor.shutdown(wait=True)
+            self._db_executor = None
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None
 
 
 # 全局会话存储单例
@@ -575,9 +691,20 @@ def get_session_store() -> SessionStore:
     global _session_store
     if _session_store is None:
         from ..config import settings
+
+        db_path = getattr(settings, "session_db_path", "") or ""
+        if db_path.lower() == "off":
+            db_path = ""
+        elif not db_path:
+            # 默认放进 workspace（compose 中是持久化卷），目录不存在则禁用
+            workspace_dir = os.environ.get("WORKSPACE_DIR", "")
+            if workspace_dir and os.path.isdir(workspace_dir):
+                db_path = os.path.join(workspace_dir, "sessions.db")
+
         _session_store = SessionStore(
             max_idle_seconds=settings.timeout.session_idle_timeout,
             max_session_seconds=settings.timeout.session_max_timeout,
+            db_path=db_path or None,
         )
     return _session_store
 

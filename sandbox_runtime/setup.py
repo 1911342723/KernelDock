@@ -111,6 +111,8 @@ def _eager_import_common_modules() -> None:
         'seaborn',
         'scipy',
         'sklearn',
+        'sympy',
+        'networkx',
     )
 
     for module_name in module_names:

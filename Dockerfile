@@ -16,14 +16,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # 安装构建依赖
 WORKDIR /build
 
-# 复制依赖文件
-COPY requirements.txt .
+# 网关只装精简依赖（沙箱全家桶在 Dockerfile.sandbox），镜像从 3.4GB 降到 ~1GB
+COPY requirements-gateway.txt .
 
-# 安装 Python 依赖到临时目录
 RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
-      pip install --no-cache-dir -i "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST" --target=/build/deps -r requirements.txt; \
+      pip install --no-cache-dir -i "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST" --target=/build/deps -r requirements-gateway.txt; \
     else \
-      pip install --no-cache-dir --target=/build/deps -r requirements.txt; \
+      pip install --no-cache-dir --target=/build/deps -r requirements-gateway.txt; \
     fi
 
 # ============================================
@@ -51,7 +50,10 @@ RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
       sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
         /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
     fi \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get update \
+    # 拉基础镜像安全补丁（修 base image 自带的 openssl/gnutls 等 OS 层 CVE）
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
     # 基础工具（健康检查需要）
     curl \
     wget \
@@ -74,7 +76,9 @@ RUN if [ "$USE_CHINA_MIRROR" = "1" ]; then \
          "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"; \
     fi \
     # 刷新字体缓存
-    && fc-cache -fv
+    && fc-cache -fv \
+    # 升级系统 pip 工具链（修 base 镜像自带 setuptools/wheel/jaraco.context CVE）
+    && pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # 创建非 root 用户（符合 Requirement 6.1：以非 root 用户身份运行）
 # 使用固定 UID/GID 以确保一致性
@@ -120,4 +124,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 
 # 启动命令
 # --ws-max-size: WebSocket 消息大小限制（50MB，支持大数据返回）
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--ws-max-size", "52428800"]
+# timeout-graceful-shutdown：SIGTERM 后给在途请求 25s 排空再硬切（配合
+# K8s terminationGracePeriodSeconds≥30 与 preStop sleep）
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--ws-max-size", "52428800", "--timeout-graceful-shutdown", "25"]

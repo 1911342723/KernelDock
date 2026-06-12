@@ -4,13 +4,6 @@
 负责沙箱文件的上传、下载、列表和清理功能。
 使用 Docker 卷挂载实现文件在宿主机和容器之间的共享。
 
-Requirements:
-- 5.1: 上传文件请求到达时将文件保存到沙箱的数据目录
-- 5.2: 支持 CSV、Excel（xlsx、xls）格式的数据文件
-- 5.3: 数据文件上传成功后自动将其加载为 pandas DataFrame 变量
-- 5.4: 提供独立的数据目录（/data）和输出目录（/output）
-- 5.5: 请求下载文件时返回指定文件的内容
-- 5.6: 沙箱销毁时清理所有关联的文件
 """
 
 import logging
@@ -30,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 
 # 支持的数据文件扩展名
-# Requirements 5.2: 支持 CSV、Excel（xlsx、xls）格式的数据文件
 SUPPORTED_DATA_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
 # 所有支持的文件扩展名（包括输出文件）
@@ -178,13 +170,6 @@ class FileManager:
     负责沙箱文件的上传、下载、列表和清理功能。
     使用 Docker 卷挂载实现文件在宿主机和容器之间的共享。
     
-    Requirements:
-    - 5.1: 上传文件请求到达时将文件保存到沙箱的数据目录
-    - 5.2: 支持 CSV、Excel（xlsx、xls）格式的数据文件
-    - 5.3: 数据文件上传成功后自动将其加载为 pandas DataFrame 变量
-    - 5.4: 提供独立的数据目录（/data）和输出目录（/output）
-    - 5.5: 请求下载文件时返回指定文件的内容
-    - 5.6: 沙箱销毁时清理所有关联的文件
     
     使用方式:
     ```python
@@ -300,10 +285,6 @@ class FileManager:
         """
         上传文件到沙箱
         
-        Requirements:
-        - 5.1: 上传文件请求到达时将文件保存到沙箱的数据目录
-        - 5.2: 支持 CSV、Excel（xlsx、xls）格式的数据文件
-        - 5.3: 数据文件上传成功后自动将其加载为 pandas DataFrame 变量
         
         Args:
             sandbox_id: 沙箱 ID
@@ -338,7 +319,6 @@ class FileManager:
             logger.info(f"文件上传成功: {safe_filename}, 大小: {file_size} 字节")
             
             # 如果是数据文件，尝试解析获取元信息
-            # Requirements 5.3: 自动将数据文件加载为 pandas DataFrame 变量
             if is_data_file(safe_filename):
                 variable_name = generate_variable_name(safe_filename)
                 
