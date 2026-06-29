@@ -44,6 +44,7 @@ class SandboxInfo:
         cpu_limit: CPU 限制（核心数）
         memory_limit_mb: 内存限制（MB）
         disk_limit_mb: 磁盘限制（MB）
+        pids_limit: 进程数限制
         network_enabled: 是否启用网络
         data_dir: 数据目录路径
         output_dir: 输出目录路径
@@ -60,6 +61,8 @@ class SandboxInfo:
     network_enabled: bool              # 是否启用网络
     data_dir: str                      # 数据目录路径
     output_dir: str                    # 输出目录路径
+    # 带默认值，置于末尾以兼容既有按关键字构造的调用点
+    pids_limit: int = 100              # 进程数限制
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -78,6 +81,7 @@ class SandboxInfo:
             "cpu_limit": self.cpu_limit,
             "memory_limit_mb": self.memory_limit_mb,
             "disk_limit_mb": self.disk_limit_mb,
+            "pids_limit": self.pids_limit,
             "network_enabled": self.network_enabled,
             "data_dir": self.data_dir,
             "output_dir": self.output_dir,

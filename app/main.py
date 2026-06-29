@@ -71,6 +71,17 @@ async def lifespan(app: FastAPI):
     """
     logger.info("KernelDock 启动中...")
 
+    # 加载持久化的资源配置（若有）：必须在沙箱管理器/资源限制器初始化「之前」应用到
+    # settings，使 ResourceLimiter.from_settings 直接读到持久化后的默认值与软上限。
+    try:
+        from .services.resource_config import load_persisted_into_settings
+
+        applied_resource_config = load_persisted_into_settings()
+        if applied_resource_config:
+            logger.info(f"已应用持久化资源配置: {applied_resource_config}")
+    except Exception as e:
+        logger.warning(f"加载持久化资源配置失败，沿用环境变量配置: {e}")
+
     # 初始化执行队列
     runtime.execution_queue = ExecutionQueue(
         max_concurrent=settings.queue.max_concurrent_executions,
@@ -197,9 +208,11 @@ app.include_router(e2b_router)
 
 # HTTP 路由（按职责拆分，见 routes/）
 from .routes import (  # noqa: E402
+    admin_console_router,
     agent_ops_router,
     execution_router,
     jobs_router,
+    resource_config_router,
     sandboxes_router,
     sessions_router,
     system_router,
@@ -210,6 +223,8 @@ app.include_router(execution_router)
 app.include_router(agent_ops_router)
 app.include_router(jobs_router)
 app.include_router(sandboxes_router)
+app.include_router(resource_config_router)
+app.include_router(admin_console_router)
 
 
 if __name__ == "__main__":

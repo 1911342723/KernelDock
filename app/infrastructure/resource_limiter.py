@@ -18,15 +18,25 @@ from .docker_client import DockerClient
 logger = logging.getLogger(__name__)
 
 
-# 资源限制的硬性边界
+# 资源限制的「绝对硬护栏」（ABSOLUTE GUARDRAILS）
+# ----------------------------------------------------------------------------
+# 这是无论 .env / 环境变量 / 运行时配置 API 怎么改，都绝不可逾越的物理与安全天花板。
+# 运行时可调的「软上限」(settings.resource.max_*) 只能在 [MIN, MAX] 区间内收紧，
+# 不能突破这里的边界。取值与 config.SandboxResourceConfig 各字段的 le 对齐，
+# 这样用户在 config 允许范围内配置的上限都能真实生效（修复此前软上限形同虚设的问题）。
 MIN_CPU = 0.5
-MAX_CPU = 4.0
+MAX_CPU = 8.0
 MIN_MEMORY_MB = 256
-MAX_MEMORY_MB = 4096
+MAX_MEMORY_MB = 16384
 MIN_DISK_MB = 512
-MAX_DISK_MB = 10240
+MAX_DISK_MB = 51200
 MIN_PIDS = 10
 MAX_PIDS = 500
+
+
+def _clamp_to_guardrail(value: float, lo: float, hi: float) -> float:
+    """把数值收敛到 [lo, hi] 绝对护栏区间内。"""
+    return min(max(value, lo), hi)
 
 
 @dataclass
@@ -166,6 +176,10 @@ class ResourceLimiter:
         default_memory_mb: int = 512,
         default_disk_mb: int = 1024,
         default_pids: int = 100,
+        max_cpu: float = MAX_CPU,
+        max_memory_mb: int = MAX_MEMORY_MB,
+        max_disk_mb: int = MAX_DISK_MB,
+        max_pids: int = MAX_PIDS,
         docker_client: Optional[DockerClient] = None
     ):
         """
@@ -176,9 +190,19 @@ class ResourceLimiter:
             default_memory_mb: 默认内存限制（MB，默认 512）
             default_disk_mb: 默认磁盘限制（MB，默认 1024）
             default_pids: 默认进程数限制（默认 100）
+            max_cpu: 可分配的 CPU 软上限（默认取绝对护栏 MAX_CPU）
+            max_memory_mb: 可分配的内存软上限（MB）
+            max_disk_mb: 可分配的磁盘软上限（MB）
+            max_pids: 可分配的进程数软上限
             docker_client: Docker 客户端实例（可选，用于查询资源使用）
         """
-        # 验证并设置默认值
+        # 先确定「软上限」：用户/配置给的上限不得超出绝对护栏 [MIN, MAX]
+        self._max_cpu = _clamp_to_guardrail(max_cpu, MIN_CPU, MAX_CPU)
+        self._max_memory_mb = int(_clamp_to_guardrail(max_memory_mb, MIN_MEMORY_MB, MAX_MEMORY_MB))
+        self._max_disk_mb = int(_clamp_to_guardrail(max_disk_mb, MIN_DISK_MB, MAX_DISK_MB))
+        self._max_pids = int(_clamp_to_guardrail(max_pids, MIN_PIDS, MAX_PIDS))
+
+        # 再把默认值收敛到 [绝对下限, 软上限]（clamp 依赖上面的软上限）
         self._default_cpu = self._clamp_cpu(default_cpu)
         self._default_memory_mb = self._clamp_memory(default_memory_mb)
         self._default_disk_mb = self._clamp_disk(default_disk_mb)
@@ -190,7 +214,9 @@ class ResourceLimiter:
             f"CPU={self._default_cpu}, "
             f"内存={self._default_memory_mb}MB, "
             f"磁盘={self._default_disk_mb}MB, "
-            f"进程数={self._default_pids}"
+            f"进程数={self._default_pids}；"
+            f"软上限: CPU={self._max_cpu}, 内存={self._max_memory_mb}MB, "
+            f"磁盘={self._max_disk_mb}MB, 进程数={self._max_pids}"
         )
     
     @classmethod
@@ -209,6 +235,11 @@ class ResourceLimiter:
             default_memory_mb=settings.resource.default_memory_mb,
             default_disk_mb=settings.resource.default_disk_mb,
             default_pids=settings.resource.default_pids,
+            max_cpu=settings.resource.max_cpu,
+            max_memory_mb=settings.resource.max_memory_mb,
+            max_disk_mb=settings.resource.max_disk_mb,
+            # config 暂无 max_pids 字段，进程数沿用绝对护栏作为软上限
+            max_pids=MAX_PIDS,
             docker_client=docker_client
         )
     
@@ -231,7 +262,108 @@ class ResourceLimiter:
     def default_pids(self) -> int:
         """获取默认进程数限制"""
         return self._default_pids
-    
+
+    @property
+    def max_cpu(self) -> float:
+        """获取可分配的 CPU 软上限"""
+        return self._max_cpu
+
+    @property
+    def max_memory_mb(self) -> int:
+        """获取可分配的内存软上限（MB）"""
+        return self._max_memory_mb
+
+    @property
+    def max_disk_mb(self) -> int:
+        """获取可分配的磁盘软上限（MB）"""
+        return self._max_disk_mb
+
+    @property
+    def max_pids(self) -> int:
+        """获取可分配的进程数软上限"""
+        return self._max_pids
+
+    def get_effective_config(self) -> Dict[str, Any]:
+        """
+        返回当前生效的资源配置（默认值 + 软上限）。
+
+        供资源配置管理 API 查询展示。
+        """
+        return {
+            "default_cpu": self._default_cpu,
+            "default_memory_mb": self._default_memory_mb,
+            "default_disk_mb": self._default_disk_mb,
+            "default_pids": self._default_pids,
+            "max_cpu": self._max_cpu,
+            "max_memory_mb": self._max_memory_mb,
+            "max_disk_mb": self._max_disk_mb,
+            "max_pids": self._max_pids,
+        }
+
+    def apply_config(
+        self,
+        *,
+        default_cpu: Optional[float] = None,
+        default_memory_mb: Optional[int] = None,
+        default_disk_mb: Optional[int] = None,
+        default_pids: Optional[int] = None,
+        max_cpu: Optional[float] = None,
+        max_memory_mb: Optional[int] = None,
+        max_disk_mb: Optional[int] = None,
+        max_pids: Optional[int] = None,
+    ) -> None:
+        """
+        运行时热更新资源配置（默认值与软上限）。
+
+        - 软上限先更新（会收敛到绝对护栏内），再据此收敛默认值；
+        - 仅传入的字段会被更新，未传入的保持不变；
+        - 调整软上限后，已有默认值若超过新上限会自动下调（clamp）。
+        """
+        # 1. 先更新软上限（决定后续默认值 clamp 的天花板）
+        if max_cpu is not None:
+            self._max_cpu = _clamp_to_guardrail(max_cpu, MIN_CPU, MAX_CPU)
+        if max_memory_mb is not None:
+            self._max_memory_mb = int(_clamp_to_guardrail(max_memory_mb, MIN_MEMORY_MB, MAX_MEMORY_MB))
+        if max_disk_mb is not None:
+            self._max_disk_mb = int(_clamp_to_guardrail(max_disk_mb, MIN_DISK_MB, MAX_DISK_MB))
+        if max_pids is not None:
+            self._max_pids = int(_clamp_to_guardrail(max_pids, MIN_PIDS, MAX_PIDS))
+
+        # 2. 更新默认值（仅对传入的字段）
+        if default_cpu is not None:
+            self._default_cpu = default_cpu
+        if default_memory_mb is not None:
+            self._default_memory_mb = default_memory_mb
+        if default_disk_mb is not None:
+            self._default_disk_mb = default_disk_mb
+        if default_pids is not None:
+            self._default_pids = default_pids
+
+        # 3. 统一把默认值收敛到 [绝对下限, 当前软上限]（覆盖上限被调小的情况）
+        self._default_cpu = self._clamp_cpu(self._default_cpu)
+        self._default_memory_mb = self._clamp_memory(self._default_memory_mb)
+        self._default_disk_mb = self._clamp_disk(self._default_disk_mb)
+        self._default_pids = self._clamp_pids(self._default_pids)
+
+        logger.info(f"资源限制器配置已热更新: {self.get_effective_config()}")
+
+    def reload_from_settings(self) -> None:
+        """
+        从当前 settings.resource 重新加载默认值与软上限。
+
+        用于运行时配置变更（PUT /admin/resource-config 写入 settings 后）把变更
+        同步到本限制器实例。config 暂无 max_pids，进程数软上限保持不变。
+        """
+        self.apply_config(
+            default_cpu=settings.resource.default_cpu,
+            default_memory_mb=settings.resource.default_memory_mb,
+            default_disk_mb=settings.resource.default_disk_mb,
+            default_pids=settings.resource.default_pids,
+            max_cpu=settings.resource.max_cpu,
+            max_memory_mb=settings.resource.max_memory_mb,
+            max_disk_mb=settings.resource.max_disk_mb,
+        )
+
     def get_limits(
         self,
         cpu: Optional[float] = None,
@@ -363,30 +495,30 @@ class ResourceLimiter:
         is_valid = True
         
         # 验证 CPU
-        if not (MIN_CPU <= limits.cpu_count <= MAX_CPU):
+        if not (MIN_CPU <= limits.cpu_count <= self._max_cpu):
             logger.warning(
-                f"CPU 限制 {limits.cpu_count} 超出范围 [{MIN_CPU}, {MAX_CPU}]"
+                f"CPU 限制 {limits.cpu_count} 超出范围 [{MIN_CPU}, {self._max_cpu}]"
             )
             is_valid = False
         
         # 验证内存
-        if not (MIN_MEMORY_MB <= limits.memory_mb <= MAX_MEMORY_MB):
+        if not (MIN_MEMORY_MB <= limits.memory_mb <= self._max_memory_mb):
             logger.warning(
-                f"内存限制 {limits.memory_mb}MB 超出范围 [{MIN_MEMORY_MB}, {MAX_MEMORY_MB}]"
+                f"内存限制 {limits.memory_mb}MB 超出范围 [{MIN_MEMORY_MB}, {self._max_memory_mb}]"
             )
             is_valid = False
         
         # 验证磁盘
-        if not (MIN_DISK_MB <= limits.disk_mb <= MAX_DISK_MB):
+        if not (MIN_DISK_MB <= limits.disk_mb <= self._max_disk_mb):
             logger.warning(
-                f"磁盘限制 {limits.disk_mb}MB 超出范围 [{MIN_DISK_MB}, {MAX_DISK_MB}]"
+                f"磁盘限制 {limits.disk_mb}MB 超出范围 [{MIN_DISK_MB}, {self._max_disk_mb}]"
             )
             is_valid = False
         
         # 验证进程数
-        if not (MIN_PIDS <= limits.pids_limit <= MAX_PIDS):
+        if not (MIN_PIDS <= limits.pids_limit <= self._max_pids):
             logger.warning(
-                f"进程数限制 {limits.pids_limit} 超出范围 [{MIN_PIDS}, {MAX_PIDS}]"
+                f"进程数限制 {limits.pids_limit} 超出范围 [{MIN_PIDS}, {self._max_pids}]"
             )
             is_valid = False
         
@@ -410,12 +542,12 @@ class ResourceLimiter:
                 limit=MIN_CPU,
                 suggestion=f"CPU 核心数不能小于 {MIN_CPU}"
             )
-        if limits.cpu_count > MAX_CPU:
+        if limits.cpu_count > self._max_cpu:
             raise ResourceLimitExceededError(
                 resource_type="cpu",
                 requested=limits.cpu_count,
-                limit=MAX_CPU,
-                suggestion=f"CPU 核心数不能大于 {MAX_CPU}"
+                limit=self._max_cpu,
+                suggestion=f"CPU 核心数不能大于 {self._max_cpu}"
             )
         
         # 验证内存
@@ -426,12 +558,12 @@ class ResourceLimiter:
                 limit=f"{MIN_MEMORY_MB}MB",
                 suggestion=f"内存限制不能小于 {MIN_MEMORY_MB}MB"
             )
-        if limits.memory_mb > MAX_MEMORY_MB:
+        if limits.memory_mb > self._max_memory_mb:
             raise ResourceLimitExceededError(
                 resource_type="memory",
                 requested=f"{limits.memory_mb}MB",
-                limit=f"{MAX_MEMORY_MB}MB",
-                suggestion=f"内存限制不能大于 {MAX_MEMORY_MB}MB"
+                limit=f"{self._max_memory_mb}MB",
+                suggestion=f"内存限制不能大于 {self._max_memory_mb}MB"
             )
         
         # 验证磁盘
@@ -442,12 +574,12 @@ class ResourceLimiter:
                 limit=f"{MIN_DISK_MB}MB",
                 suggestion=f"磁盘限制不能小于 {MIN_DISK_MB}MB"
             )
-        if limits.disk_mb > MAX_DISK_MB:
+        if limits.disk_mb > self._max_disk_mb:
             raise ResourceLimitExceededError(
                 resource_type="disk",
                 requested=f"{limits.disk_mb}MB",
-                limit=f"{MAX_DISK_MB}MB",
-                suggestion=f"磁盘限制不能大于 {MAX_DISK_MB}MB"
+                limit=f"{self._max_disk_mb}MB",
+                suggestion=f"磁盘限制不能大于 {self._max_disk_mb}MB"
             )
         
         # 验证进程数
@@ -458,12 +590,12 @@ class ResourceLimiter:
                 limit=MIN_PIDS,
                 suggestion=f"进程数限制不能小于 {MIN_PIDS}"
             )
-        if limits.pids_limit > MAX_PIDS:
+        if limits.pids_limit > self._max_pids:
             raise ResourceLimitExceededError(
                 resource_type="pids",
                 requested=limits.pids_limit,
-                limit=MAX_PIDS,
-                suggestion=f"进程数限制不能大于 {MAX_PIDS}"
+                limit=self._max_pids,
+                suggestion=f"进程数限制不能大于 {self._max_pids}"
             )
     
     def _clamp_cpu(self, cpu: float) -> float:
@@ -481,11 +613,11 @@ class ResourceLimiter:
                 f"CPU 限制 {cpu} 小于最小值 {MIN_CPU}，使用最小值"
             )
             return MIN_CPU
-        if cpu > MAX_CPU:
+        if cpu > self._max_cpu:
             logger.warning(
-                f"CPU 限制 {cpu} 大于最大值 {MAX_CPU}，使用最大值"
+                f"CPU 限制 {cpu} 大于软上限 {self._max_cpu}，收敛到软上限"
             )
-            return MAX_CPU
+            return self._max_cpu
         return cpu
     
     def _clamp_memory(self, memory_mb: int) -> int:
@@ -503,11 +635,11 @@ class ResourceLimiter:
                 f"内存限制 {memory_mb}MB 小于最小值 {MIN_MEMORY_MB}MB，使用最小值"
             )
             return MIN_MEMORY_MB
-        if memory_mb > MAX_MEMORY_MB:
+        if memory_mb > self._max_memory_mb:
             logger.warning(
-                f"内存限制 {memory_mb}MB 大于最大值 {MAX_MEMORY_MB}MB，使用最大值"
+                f"内存限制 {memory_mb}MB 大于软上限 {self._max_memory_mb}MB，收敛到软上限"
             )
-            return MAX_MEMORY_MB
+            return self._max_memory_mb
         return memory_mb
     
     def _clamp_disk(self, disk_mb: int) -> int:
@@ -525,11 +657,11 @@ class ResourceLimiter:
                 f"磁盘限制 {disk_mb}MB 小于最小值 {MIN_DISK_MB}MB，使用最小值"
             )
             return MIN_DISK_MB
-        if disk_mb > MAX_DISK_MB:
+        if disk_mb > self._max_disk_mb:
             logger.warning(
-                f"磁盘限制 {disk_mb}MB 大于最大值 {MAX_DISK_MB}MB，使用最大值"
+                f"磁盘限制 {disk_mb}MB 大于软上限 {self._max_disk_mb}MB，收敛到软上限"
             )
-            return MAX_DISK_MB
+            return self._max_disk_mb
         return disk_mb
     
     def _clamp_pids(self, pids: int) -> int:
@@ -547,9 +679,9 @@ class ResourceLimiter:
                 f"进程数限制 {pids} 小于最小值 {MIN_PIDS}，使用最小值"
             )
             return MIN_PIDS
-        if pids > MAX_PIDS:
+        if pids > self._max_pids:
             logger.warning(
-                f"进程数限制 {pids} 大于最大值 {MAX_PIDS}，使用最大值"
+                f"进程数限制 {pids} 大于软上限 {self._max_pids}，收敛到软上限"
             )
-            return MAX_PIDS
+            return self._max_pids
         return pids

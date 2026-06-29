@@ -59,11 +59,16 @@ services:
       - SANDBOX_DOCKER_IMAGE=${SANDBOX_DOCKER_IMAGE:-kerneldock-sandbox:v2.0.0}
 
       # ============ 资源限制配置（针对4C8G服务器优化） ============
-      - SANDBOX_RESOURCE__DEFAULT_CPU=1.0              # 每个沙箱最多占 1核
-      - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=512        # 每个沙箱 512MB（256太小，kernel启动就OOM）
-      - SANDBOX_RESOURCE__DEFAULT_DISK_MB=1024         # 每个沙箱 1GB 磁盘
-      - SANDBOX_RESOURCE__MAX_CPU=2.0                  # 最大允许 2核
-      - SANDBOX_RESOURCE__MAX_MEMORY_MB=2048           # 最大允许 2GB
+      # 三层模型：default=未指定时的默认值；max=单沙箱可分配软上限（超限自动收敛，
+      # 现已真实生效）；绝对护栏在代码内固定，软上限不可逾越。也可经
+      # GET /resource-config 查看、PUT /admin/resource-config 运行时热调整并持久化。
+      - SANDBOX_RESOURCE__DEFAULT_CPU=1.0              # 每个沙箱默认占 1核
+      - SANDBOX_RESOURCE__DEFAULT_MEMORY_MB=512        # 每个沙箱默认 512MB（256太小，kernel启动就OOM）
+      - SANDBOX_RESOURCE__DEFAULT_DISK_MB=1024         # 每个沙箱默认 1GB 磁盘
+      - SANDBOX_RESOURCE__DEFAULT_PIDS=100             # 每个沙箱默认 100 个进程
+      - SANDBOX_RESOURCE__MAX_CPU=2.0                  # 单沙箱可分配 CPU 软上限 2核
+      - SANDBOX_RESOURCE__MAX_MEMORY_MB=2048           # 单沙箱可分配内存软上限 2GB
+      - SANDBOX_RESOURCE__MAX_DISK_MB=10240            # 单沙箱可分配磁盘软上限 10GB
 
       # ============ 并发控制配置 ============
       # 共享租约开启后无状态并发 = pool × shared_max_per_container（2×4=8 常态，
@@ -125,6 +130,9 @@ services:
       # ============ 安全配置 ============
       # API Key：逗号分隔多个；留空禁用认证（仅限开发环境！）
       - SANDBOX_API_KEYS=${SANDBOX_API_KEYS:-}
+      # 管理端 token：保护 /admin/* 端点（含 /admin/resource-config 运行时改资源配置）。
+      # 留空则所有 admin 写操作一律 403，生产务必设置。
+      - SANDBOX_ADMIN_TOKEN=${SANDBOX_ADMIN_TOKEN:-}
       # AST 静态校验模式: block / warn / off（默认 warn，安全边界在容器层）
       - SANDBOX_VALIDATION_MODE=${SANDBOX_VALIDATION_MODE:-warn}
       # CORS: 生产环境应设置为实际前端域名，逗号分隔；

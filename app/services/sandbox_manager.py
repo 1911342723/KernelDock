@@ -253,6 +253,7 @@ class SandboxManager(SandboxExecutionMixin, SandboxProvisioningMixin, SandboxAge
         cpu_limit: Optional[float] = None,
         memory_limit_mb: Optional[int] = None,
         disk_limit_mb: Optional[int] = None,
+        pids_limit: Optional[int] = None,
         network_enabled: Optional[bool] = None,
         timeout_seconds: Optional[int] = None,
     ) -> SandboxInfo:
@@ -263,9 +264,10 @@ class SandboxManager(SandboxExecutionMixin, SandboxProvisioningMixin, SandboxAge
 
         Args:
             session_id: 会话标识符
-            cpu_limit: CPU 核心数限制（可选）
-            memory_limit_mb: 内存限制（MB，可选）
-            disk_limit_mb: 磁盘限制（MB，可选）
+            cpu_limit: CPU 核心数限制（可选，超软上限自动收敛）
+            memory_limit_mb: 内存限制（MB，可选，超软上限自动收敛）
+            disk_limit_mb: 磁盘限制（MB，可选，超软上限自动收敛）
+            pids_limit: 进程数限制（可选，超软上限自动收敛）
             network_enabled: 是否启用网络访问（可选）
             timeout_seconds: 沙箱超时时间（秒，可选）
 
@@ -297,7 +299,8 @@ class SandboxManager(SandboxExecutionMixin, SandboxProvisioningMixin, SandboxAge
             resource_limits = self._resource_limiter.get_limits(
                 cpu=cpu_limit,
                 memory_mb=memory_limit_mb,
-                disk_mb=disk_limit_mb
+                disk_mb=disk_limit_mb,
+                pids=pids_limit
             )
 
             # 获取网络策略
@@ -334,6 +337,7 @@ class SandboxManager(SandboxExecutionMixin, SandboxProvisioningMixin, SandboxAge
                 cpu_limit=resource_limits.cpu_count,
                 memory_limit_mb=resource_limits.memory_mb,
                 disk_limit_mb=resource_limits.disk_mb,
+                pids_limit=resource_limits.pids_limit,
                 network_enabled=network_policy.enabled and network_policy.allow_outbound,
                 data_dir=data_dir,
                 output_dir=output_dir

@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KernelDock · 控制台</title>
+<style>
+  :root {
+    --bg: #f4f6f9; --card: #ffffff; --ink: #1f2937; --muted: #6b7280;
+    --line: #e5e7eb; --brand: #2563eb; --brand-d: #1d4ed8; --soft: #eef2f7;
+    --ok: #047857; --ok-bg: #ecfdf5; --warn: #b45309; --warn-bg: #fffbeb;
+    --err: #b91c1c; --err-bg: #fef2f2; --chip: #eef2ff; --panel: #fff; --code: #0b1020;
+  }
+  html[data-theme="dark"] {
+    --bg: #0b1220; --card: #131c2e; --ink: #e5e7eb; --muted: #94a3b8;
+    --line: #273449; --brand: #3b82f6; --brand-d: #60a5fa; --soft: #1e293b;
+    --ok: #34d399; --ok-bg: #06281f; --warn: #fbbf24; --warn-bg: #2a2007;
+    --err: #f87171; --err-bg: #2a0f0f; --chip: #1e3a8a; --panel: #131c2e; --code: #05080f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); transition: background .2s, color .2s;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+      "Microsoft YaHei", Arial, sans-serif; font-size: 14px; line-height: 1.5; }
+  header.top { background: linear-gradient(135deg, #1e3a8a, #2563eb); color: #fff;
+    padding: 16px 24px; box-shadow: 0 1px 4px rgba(0,0,0,.15); display: flex;
+    align-items: center; justify-content: space-between; gap: 12px; }
+  header.top h1 { margin: 0; font-size: 19px; font-weight: 650; }
+  header.top p { margin: 3px 0 0; opacity: .85; font-size: 12.5px; }
+  .theme-btn { background: rgba(255,255,255,.15); color: #fff; border: none; border-radius: 8px;
+    padding: 8px 12px; cursor: pointer; font-size: 13px; }
+  .theme-btn:hover { background: rgba(255,255,255,.25); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 18px 16px 60px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+  .card h2 { margin: 0 0 4px; font-size: 15px; font-weight: 650; }
+  .card h3 { margin: 16px 0 8px; font-size: 13.5px; font-weight: 650; color: var(--ink); }
+  .card .desc { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+  input[type=text], input[type=password], input[type=number], select {
+    width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
+    font-size: 14px; color: var(--ink); background: var(--panel); outline: none; }
+  input:focus, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
+  input.invalid { border-color: var(--err); box-shadow: 0 0 0 3px rgba(185,28,28,.12); }
+  input.changed { background: var(--warn-bg); }
+  .field { margin-bottom: 12px; }
+  button { border: none; border-radius: 8px; padding: 9px 16px; font-size: 14px;
+    font-weight: 600; cursor: pointer; transition: background .15s, opacity .15s; }
+  button.primary { background: var(--brand); color: #fff; }
+  button.primary:hover { background: var(--brand-d); }
+  button.ghost { background: var(--soft); color: var(--ink); }
+  button.mini { padding: 5px 10px; font-size: 12px; }
+  button.danger { background: #fee2e2; color: #b91c1c; }
+  html[data-theme="dark"] button.danger { background: #3a1414; color: #fca5a5; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  td.res { font-weight: 600; white-space: nowrap; }
+  td input { max-width: 150px; }
+  td.muted, .muted { color: var(--muted); }
+  .nowrap { white-space: nowrap; }
+  .banner { border-radius: 9px; padding: 11px 14px; margin-bottom: 14px; font-size: 13px; display: none; }
+  .banner.show { display: block; }
+  .banner.ok { background: var(--ok-bg); color: var(--ok); border: 1px solid rgba(4,120,87,.3); }
+  .banner.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid rgba(180,83,9,.3); }
+  .banner.err { background: var(--err-bg); color: var(--err); border: 1px solid rgba(185,28,28,.3); }
+  .banner ul { margin: 6px 0 0; padding-left: 18px; }
+  .hint { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+  details summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+  code { background: var(--soft); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .tabs { display: flex; gap: 6px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .tab { background: transparent; color: var(--muted); border: 1px solid transparent;
+    border-radius: 8px; padding: 8px 14px; }
+  .tab:hover { background: var(--soft); }
+  .tab.active { background: var(--card); color: var(--brand-d); border-color: var(--line);
+    box-shadow: 0 1px 2px rgba(16,24,40,.05); }
+  .tabs .spacer { flex: 1; }
+  .auto { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .panel.hidden { display: none; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .stat-v { font-size: 22px; font-weight: 700; color: var(--ink); }
+  .stat-l { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .stat-s { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .trends { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-top: 14px; }
+  .trend { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .trend .t-l { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+  .trend svg { width: 100%; height: 42px; display: block; margin-top: 6px; }
+  .badge { display: inline-block; border-radius: 999px; padding: 2px 9px; font-size: 12px; font-weight: 600; }
+  .badge.running { background: var(--ok-bg); color: var(--ok); }
+  .badge.creating { background: #eff6ff; color: #1d4ed8; }
+  html[data-theme="dark"] .badge.creating { background: #10213f; color: #93c5fd; }
+  .badge.stopped, .badge.error { background: var(--err-bg); color: var(--err); }
+  .badge.other { background: var(--soft); color: var(--muted); }
+  table.kv td.kv-k { width: 240px; font-weight: 600; color: var(--ink); vertical-align: top; }
+  pre { margin: 0; background: var(--code); color: #d1d5db; padding: 10px 12px; border-radius: 8px;
+    font-size: 12px; overflow: auto; max-height: 320px; }
+  .row-click { cursor: pointer; }
+  .detail { background: var(--soft); }
+  .toolbar-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>KernelDock · 控制台</h1>
+    <p>运维看板 + 资源配置 —— 概览 / 沙箱 / 队列统计 / 资源分配</p>
+  </div>
+  <button class="theme-btn" id="themeBtn" onclick="toggleTheme()">🌙 深色</button>
+</header>
+
+<div class="wrap">
+
+  <div id="banner" class="banner"></div>
+
+  <div class="card">
+    <details class="creds" open>
+      <summary>访问凭证</summary>
+      <div class="grid2" style="margin-top:12px">
+        <div class="field">
+          <label>API Key（服务启用 SANDBOX_API_KEYS 时必填，否则留空）</label>
+          <input type="password" id="apiKey" placeholder="留空表示服务未启用 API Key" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label>Admin Token（保存配置等写操作必填）</label>
+          <input type="password" id="adminToken" placeholder="对应 SANDBOX_ADMIN_TOKEN" autocomplete="off" />
+        </div>
+      </div>
+      <div class="hint">凭证仅保存在本浏览器 localStorage，不会上传到服务端之外。</div>
+    </details>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="overview" onclick="showTab('overview')">概览</button>
+    <button class="tab" data-tab="sandboxes" onclick="showTab('sandboxes')">沙箱</button>
+    <button class="tab" data-tab="queue" onclick="showTab('queue')">队列 &amp; 统计</button>
+    <button class="tab" data-tab="config" onclick="showTab('config')">资源配置</button>
+    <span class="spacer"></span>
+    <button class="ghost mini" onclick="refreshActive()">刷新</button>
+    <label class="auto"><input type="checkbox" id="autoRefresh" checked /> 自动刷新 5s</label>
+  </div>
+
+  <!-- 概览 -->
+  <section id="panel-overview" class="panel card">
+    <div class="toolbar-row">
+      <h2 style="margin:0">概览</h2>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost mini" onclick="cleanupSessions()">清理过期会话</button>
+    </div>
+    <div class="stats" id="ovStats"><span class="muted">加载中…</span></div>
+    <div class="trends" id="ovTrends"></div>
+  </section>
+
+  <!-- 沙箱 -->
+  <section id="panel-sandboxes" class="panel card hidden">
+    <details style="margin-bottom:14px">
+      <summary>新建会话（按需分配资源）</summary>
+      <div class="grid2" style="margin-top:12px">
+        <div class="field"><label>CPU 核心</label><input type="number" id="cs_cpu" step="0.5" placeholder="留空用默认" /></div>
+        <div class="field"><label>内存 (MB)</label><input type="number" id="cs_memory_mb" step="1" placeholder="留空用默认" /></div>
+        <div class="field"><label>磁盘 (MB)</label><input type="number" id="cs_disk_mb" step="1" placeholder="留空用默认" /></div>
+        <div class="field"><label>进程数 (pids)</label><input type="number" id="cs_pids" step="1" placeholder="留空用默认" /></div>
+      </div>
+      <button class="primary" onclick="createSession()">创建会话</button>
+      <span class="hint">超过软上限会自动收敛；创建后下表会显示实际分配的资源。</span>
+    </details>
+    <div class="toolbar-row">
+      <h2 style="margin:0">活跃沙箱</h2>
+      <span class="spacer" style="flex:1"></span>
+      <label class="auto" style="margin:0">状态
+        <select id="stateFilter" style="width:auto" onchange="loadSandboxes()">
+          <option value="">全部</option>
+          <option value="running">running</option>
+          <option value="creating">creating</option>
+          <option value="paused">paused</option>
+          <option value="stopped">stopped</option>
+          <option value="error">error</option>
+        </select>
+      </label>
+    </div>
+    <p class="desc" id="sbSummary">加载中…</p>
+    <div style="overflow:auto">
+      <table>
+        <thead><tr>
+          <th>沙箱 ID</th><th>会话</th><th>状态</th><th>CPU</th><th>内存(MB)</th>
+          <th>磁盘(MB)</th><th>pids</th><th>网络</th><th>创建时间</th><th>操作</th>
+        </tr></thead>
+        <tbody id="sbTbody"><tr><td colspan="10" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <p class="hint">点击任意行展开该沙箱的实时资源指标。</p>
+  </section>
+
+  <!-- 队列 & 统计 -->
+  <section id="panel-queue" class="panel card hidden">
+    <h2>队列 &amp; 统计</h2>
+    <h3>执行队列 /queue/status</h3>
+    <div id="queueKV"><span class="muted">加载中…</span></div>
+    <h3>服务统计 /statistics</h3>
+    <div id="statsKV"><span class="muted">加载中…</span></div>
+  </section>
+
+  <!-- 资源配置 -->
+  <section id="panel-config" class="panel card hidden">
+    <h2>资源默认值与软上限</h2>
+    <p class="desc">
+      <b>default</b>：创建沙箱/池容器未显式指定时使用；
+      <b>max</b>：单沙箱可分配软上限（创建会话超限自动收敛 clamp）；
+      <b>绝对护栏</b>：不可逾越的安全天花板（超护栏的输入会标红并禁止保存）。
+    </p>
+    <table>
+      <thead><tr><th>资源</th><th>默认值 (default)</th><th>软上限 (max)</th><th>绝对护栏</th></tr></thead>
+      <tbody>
+        <tr><td class="res">CPU 核心</td>
+          <td><input type="number" id="def_cpu" step="0.5" /></td>
+          <td><input type="number" id="max_cpu" step="0.5" /></td>
+          <td class="muted" id="gr_cpu">—</td></tr>
+        <tr><td class="res">内存 (MB)</td>
+          <td><input type="number" id="def_memory_mb" step="1" /></td>
+          <td><input type="number" id="max_memory_mb" step="1" /></td>
+          <td class="muted" id="gr_memory_mb">—</td></tr>
+        <tr><td class="res">磁盘 (MB)</td>
+          <td><input type="number" id="def_disk_mb" step="1" /></td>
+          <td><input type="number" id="max_disk_mb" step="1" /></td>
+          <td class="muted" id="gr_disk_mb">—</td></tr>
+        <tr><td class="res">进程数 (pids)</td>
+          <td><input type="number" id="def_pids" step="1" /></td>
+          <td class="muted" id="max_pids_cell">护栏固定</td>
+          <td class="muted" id="gr_pids">—</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:14px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+      <button class="primary" id="btnSave" onclick="saveConfig()">保存配置</button>
+      <button class="ghost" onclick="resetConfig()">重置改动</button>
+      <button class="ghost" onclick="loadResourceConfig()">重新加载</button>
+      <span id="runtimeState" class="muted" style="font-size:12.5px"></span>
+    </div>
+    <p class="hint">磁盘限制依赖底层存储驱动，当前作为元数据记录；修改默认值影响新建容器，已有预热池容器随老化轮替后生效。</p>
+  </section>
+
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const LS = { api: "kd_api_key", admin: "kd_admin_token", theme: "kd_theme", tab: "kd_tab", auto: "kd_auto" };
+  const CFG_FIELDS = ["def_cpu","def_memory_mb","def_disk_mb","def_pids","max_cpu","max_memory_mb","max_disk_mb"];
+  let currentTab = "overview";
+  let expandedId = null;
+  let cfgBaseline = {};
+  const hist = { cpu: [], mem: [], q: [] };
+  const HIST_MAX = 40;
+
+  // ---- theme ----
+  function applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    $("themeBtn").textContent = t === "dark" ? "☀️ 浅色" : "🌙 深色";
+  }
+  function toggleTheme() {
+    const t = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    localStorage.setItem(LS.theme, t); applyTheme(t);
+  }
+
+  // ---- creds ----
+  function restoreCreds() {
+    $("apiKey").value = localStorage.getItem(LS.api) || "";
+    $("adminToken").value = localStorage.getItem(LS.admin) || "";
+  }
+  function persistCreds() {
+    localStorage.setItem(LS.api, $("apiKey").value.trim());
+    localStorage.setItem(LS.admin, $("adminToken").value.trim());
+  }
+  function headers(withAdmin) {
+    const h = { "Content-Type": "application/json" };
+    const api = $("apiKey").value.trim();
+    if (api) h["Authorization"] = "Bearer " + api;
+    if (withAdmin) { const tok = $("adminToken").value.trim(); if (tok) h["X-Admin-Token"] = tok; }
+    return h;
+  }
+  function banner(type, html) {
+    const b = $("banner"); b.className = "banner show " + type; b.innerHTML = html;
+    if (type === "ok") setTimeout(() => { b.className = "banner"; }, 6000);
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+  function numOrNull(id) {
+    const v = $(id).value.trim(); if (v === "") return null;
+    const n = Number(v); return Number.isFinite(n) ? n : null;
+  }
+  function shortId(s) { return s ? String(s).slice(0, 12) : "-"; }
+  function fmtTime(s) { if (!s) return "-"; try { return new Date(s).toLocaleString(); } catch (e) { return s; } }
+  function fmtUptime(sec) {
+    if (sec == null) return "-"; sec = Math.floor(sec);
+    const d = Math.floor(sec/86400), h = Math.floor((sec%86400)/3600), m = Math.floor((sec%3600)/60);
+    if (d) return d+"d "+h+"h"; if (h) return h+"h "+m+"m"; return m+"m";
+  }
+  function fmtBytes(n) {
+    if (n == null) return "-"; const u=["B","KB","MB","GB"]; let i=0, v=Number(n);
+    while (v>=1024 && i<u.length-1) { v/=1024; i++; } return v.toFixed(i?1:0)+u[i];
+  }
+  async function fetchJson(url) {
+    const res = await fetch(url, { headers: headers(false) });
+    if (res.status === 401) throw new Error("API Key 无效或缺失");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }
+  function renderKV(el, obj) {
+    if (obj == null) { el.innerHTML = '<p class="muted">无数据</p>'; return; }
+    let rows = "";
+    for (const [k, v] of Object.entries(obj)) {
+      let val = (v !== null && typeof v === "object")
+        ? "<pre>" + escapeHtml(JSON.stringify(v, null, 2)) + "</pre>" : escapeHtml(String(v));
+      rows += '<tr><td class="kv-k">' + escapeHtml(k) + "</td><td>" + val + "</td></tr>";
+    }
+    el.innerHTML = '<table class="kv">' + rows + "</table>";
+  }
+  function statCard(label, value, sub) {
+    return '<div class="stat"><div class="stat-v">' + value + '</div><div class="stat-l">' +
+      label + "</div>" + (sub ? '<div class="stat-s">' + sub + "</div>" : "") + "</div>";
+  }
+  function sparkline(data, color, max) {
+    const W = 170, H = 42;
+    if (!data.length) return '<svg viewBox="0 0 '+W+' '+H+'"></svg>';
+    const mx = max != null ? max : Math.max(1, Math.max.apply(null, data));
+    const step = data.length > 1 ? W/(data.length-1) : W;
+    const pts = data.map((v,i) => (i*step).toFixed(1)+","+(H-(Math.min(v,mx)/mx)*H).toFixed(1)).join(" ");
+    return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
+      + '<polyline fill="none" stroke="'+color+'" stroke-width="2" points="'+pts+'"/></svg>';
+  }
+  function trendCard(label, last, data, color, max) {
+    return '<div class="trend"><div class="t-l"><span>'+label+'</span><b>'+last+'</b></div>'
+      + sparkline(data, color, max) + '</div>';
+  }
+  function pushHist(arr, v) { arr.push(v); if (arr.length > HIST_MAX) arr.shift(); }
+
+  // ---- tabs ----
+  function showTab(name) {
+    currentTab = name; localStorage.setItem(LS.tab, name);
+    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
+    ["overview","sandboxes","queue","config"].forEach((p) => $("panel-"+p).classList.toggle("hidden", p !== name));
+    refreshActive();
+  }
+  function refreshActive() {
+    if (currentTab === "overview") loadOverview();
+    else if (currentTab === "sandboxes") loadSandboxes();
+    else if (currentTab === "queue") loadQueueStats();
+    else if (currentTab === "config") loadResourceConfig();
+  }
+
+  // ---- overview ----
+  async function loadOverview() {
+    try {
+      const [h, q] = await Promise.all([fetchJson("/health"), fetchJson("/queue/status")]);
+      let c = "";
+      c += statCard("服务状态", h.status ?? "-");
+      c += statCard("活跃沙箱", h.active_sandboxes ?? "-");
+      c += statCard("容器池", (h.pool_available ?? "-")+" / "+(h.pool_total ?? "-"), "可用 / 总数");
+      c += statCard("CPU", (h.cpu_usage_percent ?? "-")+"%");
+      c += statCard("内存", (h.memory_usage_percent ?? "-")+"%");
+      c += statCard("运行时长", fmtUptime(h.uptime_seconds));
+      const qDepth = q && q.enabled ? (q.queue_depth ?? q.waiting ?? 0) : null;
+      if (q && q.enabled) {
+        c += statCard("排队", qDepth ?? "-");
+        c += statCard("执行中", q.executing_count ?? q.executing ?? "-");
+        c += statCard("并发上限", q.max_concurrent ?? "-");
+        c += statCard("平均耗时", q.avg_execution_time != null ? Number(q.avg_execution_time).toFixed(2)+"s" : "-");
+      }
+      $("ovStats").innerHTML = c;
+      if (typeof h.cpu_usage_percent === "number") pushHist(hist.cpu, h.cpu_usage_percent);
+      if (typeof h.memory_usage_percent === "number") pushHist(hist.mem, h.memory_usage_percent);
+      if (qDepth != null) pushHist(hist.q, Number(qDepth));
+      $("ovTrends").innerHTML =
+        trendCard("CPU %", (hist.cpu.slice(-1)[0] ?? "-")+"%", hist.cpu, "#2563eb", 100)
+        + trendCard("内存 %", (hist.mem.slice(-1)[0] ?? "-")+"%", hist.mem, "#059669", 100)
+        + trendCard("队列深度", (hist.q.slice(-1)[0] ?? "-"), hist.q, "#d97706");
+    } catch (e) {
+      $("ovStats").innerHTML = '<span class="muted">加载失败：'+escapeHtml(e.message)+"</span>";
+    }
+  }
+  async function cleanupSessions() {
+    if (!confirm("确认清理过期会话？")) return;
+    try {
+      const res = await fetch("/cleanup", { method: "POST", headers: headers(false) });
+      if (res.status === 401) return banner("err", "清理失败：API Key 无效或缺失。");
+      if (!res.ok) return banner("err", "清理失败：HTTP "+res.status);
+      const data = await res.json();
+      banner("ok", "已清理 "+(data.cleaned ?? 0)+" 个过期会话。");
+      loadOverview();
+    } catch (e) { banner("err", "清理失败："+e.message); }
+  }
+
+  // ---- sandboxes ----
+  async function loadSandboxes() {
+    try {
+      const st = $("stateFilter").value;
+      const data = await fetchJson("/sandboxes" + (st ? ("?state="+encodeURIComponent(st)) : ""));
+      $("sbSummary").innerHTML = "活跃 <b>"+(data.active_count ?? "-")+"</b> / 上限 <b>"+
+        (data.max_concurrent ?? "-")+"</b> · 列表共 "+(data.total ?? 0)+
+        (data.message ? " · "+escapeHtml(data.message) : "");
+      const list = data.sandboxes || [];
+      if (!list.length) { $("sbTbody").innerHTML = '<tr><td colspan="10" class="muted">暂无沙箱</td></tr>'; return; }
+      let html = "";
+      for (const s of list) {
+        const st2 = String(s.state || "other");
+        const cls = ["running","creating","stopped","error"].includes(st2) ? st2 : "other";
+        const sid = escapeHtml(s.sandbox_id);
+        html += '<tr class="row-click" onclick="toggleMetrics(\'' + sid + '\')">' +
+          '<td class="nowrap" title="'+escapeHtml(s.sandbox_id||"")+'">'+shortId(s.sandbox_id)+"</td>" +
+          '<td class="nowrap" title="'+escapeHtml(s.session_id||"")+'">'+shortId(s.session_id)+"</td>" +
+          '<td><span class="badge '+cls+'">'+escapeHtml(st2)+"</span></td>" +
+          "<td>"+(s.cpu_limit ?? "-")+"</td><td>"+(s.memory_limit_mb ?? "-")+"</td>" +
+          "<td>"+(s.disk_limit_mb ?? "-")+"</td><td>"+(s.pids_limit ?? "-")+"</td>" +
+          "<td>"+(s.network_enabled ? "是" : "否")+"</td>" +
+          '<td class="muted nowrap">'+fmtTime(s.created_at)+"</td>" +
+          '<td onclick="event.stopPropagation()"><button class="mini danger" onclick="destroySandbox(\'' + sid + '\')">销毁</button></td>' +
+          "</tr>";
+        if (s.sandbox_id === expandedId) {
+          html += '<tr class="detail"><td colspan="10" id="metrics-'+sid+'"><span class="muted">加载指标…</span></td></tr>';
+        }
+      }
+      $("sbTbody").innerHTML = html;
+      if (expandedId && list.some((s) => s.sandbox_id === expandedId)) loadSandboxMetrics(expandedId);
+    } catch (e) {
+      $("sbTbody").innerHTML = '<tr><td colspan="10" class="muted">加载失败：'+escapeHtml(e.message)+"</td></tr>";
+    }
+  }
+  function toggleMetrics(id) { expandedId = (expandedId === id) ? null : id; loadSandboxes(); }
+  async function loadSandboxMetrics(id) {
+    const cell = $("metrics-" + id); if (!cell) return;
+    try {
+      const m = await fetchJson("/sandboxes/"+encodeURIComponent(id)+"/metrics");
+      const memPct = m.memory_limit_mb ? ((m.memory_used_mb/m.memory_limit_mb)*100).toFixed(1) : "-";
+      const diskPct = m.disk_limit_mb ? ((m.disk_used_mb/m.disk_limit_mb)*100).toFixed(1) : "-";
+      cell.innerHTML = '<div class="stats">' +
+        statCard("CPU", (m.cpu_percent ?? "-")+"%") +
+        statCard("内存", (m.memory_used_mb ?? "-")+" MB", memPct+"% / "+(m.memory_limit_mb ?? "-")+"MB") +
+        statCard("磁盘", (m.disk_used_mb ?? "-")+" MB", diskPct+"% / "+(m.disk_limit_mb ?? "-")+"MB") +
+        statCard("网络 ↓", fmtBytes(m.network_rx_bytes)) +
+        statCard("网络 ↑", fmtBytes(m.network_tx_bytes)) +
+        "</div>";
+    } catch (e) {
+      cell.innerHTML = '<span class="muted">指标不可用：'+escapeHtml(e.message)+"</span>";
+    }
+  }
+  async function destroySandbox(id) {
+    if (!id) return;
+    if (!confirm("确认强制销毁沙箱 "+id+" ？该操作不可撤销。")) return;
+    try {
+      const res = await fetch("/sandboxes/"+encodeURIComponent(id), { method: "DELETE", headers: headers(false) });
+      if (res.status === 401) return banner("err", "销毁失败：API Key 无效或缺失。");
+      if (res.status === 404) return banner("warn", "沙箱不存在或已被回收。");
+      if (!res.ok) return banner("err", "销毁失败：HTTP "+res.status);
+      if (expandedId === id) expandedId = null;
+      banner("ok", "已销毁沙箱 "+escapeHtml(id)+"。"); loadSandboxes();
+    } catch (e) { banner("err", "销毁失败："+e.message); }
+  }
+  async function createSession() {
+    persistCreds();
+    const body = {
+      cpu_limit: numOrNull("cs_cpu"), memory_limit_mb: numOrNull("cs_memory_mb"),
+      disk_limit_mb: numOrNull("cs_disk_mb"), pids_limit: numOrNull("cs_pids"),
+    };
+    Object.keys(body).forEach((k) => body[k] === null && delete body[k]);
+    try {
+      const res = await fetch("/sessions", { method: "POST", headers: headers(false), body: JSON.stringify(body) });
+      if (res.status === 401) return banner("err", "创建失败：API Key 无效或缺失。");
+      if (!res.ok) return banner("err", "创建失败：HTTP "+res.status);
+      const d = await res.json();
+      const alloc = (d.cpu_limit != null)
+        ? ("实际分配：CPU "+d.cpu_limit+" · 内存 "+d.memory_limit_mb+"MB · 磁盘 "+d.disk_limit_mb+"MB · pids "+d.pids_limit)
+        : "（本地回退/无沙箱模式，未分配容器资源）";
+      banner("ok", "会话已创建：<code>"+escapeHtml(d.session_id)+"</code><br>"+escapeHtml(alloc));
+      loadSandboxes();
+    } catch (e) { banner("err", "创建失败："+e.message); }
+  }
+
+  // ---- queue & stats ----
+  async function loadQueueStats() {
+    try {
+      const [q, s] = await Promise.all([fetchJson("/queue/status"), fetchJson("/statistics")]);
+      renderKV($("queueKV"), q); renderKV($("statsKV"), s);
+    } catch (e) {
+      $("queueKV").innerHTML = '<span class="muted">加载失败：'+escapeHtml(e.message)+"</span>"; $("statsKV").innerHTML = "";
+    }
+  }
+
+  // ---- resource config ----
+  async function loadResourceConfig() {
+    persistCreds();
+    try { fillForm(await fetchJson("/resource-config")); }
+    catch (e) { banner("err", "读取资源配置失败："+e.message); }
+  }
+  function fillForm(cfg) {
+    const d = cfg.default || {}, m = cfg.max || {}, g = cfg.guardrails || {};
+    const set = (id, v) => { $(id).value = v; };
+    set("def_cpu", d.cpu); set("def_memory_mb", d.memory_mb); set("def_disk_mb", d.disk_mb); set("def_pids", d.pids);
+    set("max_cpu", m.cpu); set("max_memory_mb", m.memory_mb); set("max_disk_mb", m.disk_mb);
+    $("max_pids_cell").textContent = "护栏固定（当前 "+(m.pids ?? "-")+"）";
+    const range = (a) => Array.isArray(a) ? (a[0]+" ~ "+a[1]) : "—";
+    $("gr_cpu").textContent = range(g.cpu); $("gr_memory_mb").textContent = range(g.memory_mb);
+    $("gr_disk_mb").textContent = range(g.disk_mb); $("gr_pids").textContent = range(g.pids);
+    const setMM = (id, a) => { if (Array.isArray(a)) { $(id).min = a[0]; $(id).max = a[1]; $(id).dataset.lo = a[0]; $(id).dataset.hi = a[1]; } };
+    setMM("def_cpu", g.cpu); setMM("max_cpu", g.cpu);
+    setMM("def_memory_mb", g.memory_mb); setMM("max_memory_mb", g.memory_mb);
+    setMM("def_disk_mb", g.disk_mb); setMM("max_disk_mb", g.disk_mb); setMM("def_pids", g.pids);
+    cfgBaseline = {}; CFG_FIELDS.forEach((id) => cfgBaseline[id] = $(id).value);
+    validateConfig();
+    const p = cfg.persistence || {};
+    const persistTxt = p.enabled
+      ? ('持久化 <b style="color:#047857">已启用</b> · <code>'+escapeHtml(p.path||"")+"</code>")
+      : '持久化 <b style="color:#b45309">未启用</b>（改动重启丢失）';
+    const smTxt = cfg.sandbox_manager_active
+      ? '沙箱管理器 <b style="color:#047857">运行中</b>' : '沙箱管理器 <b style="color:#b45309">未启用</b>';
+    $("runtimeState").innerHTML = persistTxt + " · " + smTxt;
+  }
+  function validateConfig() {
+    let ok = true;
+    CFG_FIELDS.forEach((id) => {
+      const el = $(id); const v = el.value.trim();
+      el.classList.toggle("changed", v !== (cfgBaseline[id] ?? "") && v !== "");
+      let bad = false;
+      if (v !== "") {
+        const n = Number(v), lo = Number(el.dataset.lo), hi = Number(el.dataset.hi);
+        if (!Number.isFinite(n) || (el.dataset.lo && n < lo) || (el.dataset.hi && n > hi)) bad = true;
+      }
+      el.classList.toggle("invalid", bad);
+      if (bad) ok = false;
+    });
+    $("btnSave").disabled = !ok;
+    return ok;
+  }
+  function resetConfig() {
+    CFG_FIELDS.forEach((id) => { $(id).value = cfgBaseline[id] ?? ""; });
+    validateConfig(); banner("ok", "已重置为最近一次加载的值。");
+  }
+  async function saveConfig() {
+    persistCreds();
+    if (!$("adminToken").value.trim()) return banner("warn", "请先填写 Admin Token 再保存。");
+    if (!validateConfig()) return banner("warn", "有输入超出绝对护栏（红框），请修正后再保存。");
+    const body = {
+      default_cpu: numOrNull("def_cpu"), default_memory_mb: numOrNull("def_memory_mb"),
+      default_disk_mb: numOrNull("def_disk_mb"), default_pids: numOrNull("def_pids"),
+      max_cpu: numOrNull("max_cpu"), max_memory_mb: numOrNull("max_memory_mb"), max_disk_mb: numOrNull("max_disk_mb"),
+    };
+    Object.keys(body).forEach((k) => body[k] === null && delete body[k]);
+    $("btnSave").disabled = true;
+    try {
+      const res = await fetch("/admin/resource-config", { method: "PUT", headers: headers(true), body: JSON.stringify(body) });
+      if (res.status === 401) return banner("err", "保存失败：API Key 无效或缺失。");
+      if (res.status === 403) return banner("err", "保存失败：Admin Token 无效。");
+      if (!res.ok) return banner("err", "保存失败：HTTP "+res.status);
+      const data = await res.json();
+      fillForm(data.config || {});
+      const warns = data.warnings || [];
+      let html = "保存成功，已热生效"+(data.persisted ? "并持久化。" : "（持久化未生效，重启会丢失）。");
+      if (warns.length) html += "<ul>"+warns.map((w)=>"<li>"+escapeHtml(w)+"</li>").join("")+"</ul>";
+      banner(warns.length ? "warn" : "ok", html);
+    } catch (e) { banner("err", "保存失败："+e.message); }
+    finally { $("btnSave").disabled = false; }
+  }
+
+  function tick() {
+    if (!$("autoRefresh").checked) return;
+    if (currentTab === "config") return;  // 编辑中不自动刷新
+    refreshActive();
+  }
+
+  // ---- init ----
+  applyTheme(localStorage.getItem(LS.theme) || "light");
+  restoreCreds();
+  CFG_FIELDS.forEach((id) => $(id).addEventListener("input", validateConfig));
+  const savedAuto = localStorage.getItem(LS.auto);
+  if (savedAuto !== null) $("autoRefresh").checked = savedAuto === "1";
+  $("autoRefresh").addEventListener("change", () => localStorage.setItem(LS.auto, $("autoRefresh").checked ? "1" : "0"));
+  showTab(localStorage.getItem(LS.tab) || "overview");
+  setInterval(tick, 5000);
+</script>
+</body>
+</html>

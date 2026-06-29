@@ -215,7 +215,7 @@ curl -X POST http://localhost:9527/sessions/<session_id>/execute \
 | Method | Path | Description |
 |------|------|------|
 | POST | `/execute` | 无状态执行，推荐用于 Agent 场景 |
-| POST | `/sessions` | 创建会话 |
+| POST | `/sessions` | 创建会话（可选 `cpu_limit`/`memory_limit_mb`/`disk_limit_mb`/`pids_limit` 分配资源） |
 | GET | `/sessions/{id}` | 查询会话信息 |
 | DELETE | `/sessions/{id}` | 删除会话和关联沙箱 |
 | POST | `/sessions/{id}/execute` | 有状态执行 |
@@ -259,6 +259,9 @@ curl -X POST http://localhost:9527/sessions/<session_id>/execute \
 | GET | `/sandboxes/{id}` | 查询沙箱详情 |
 | DELETE | `/sandboxes/{id}` | 强制销毁沙箱 |
 | GET | `/sandboxes/{id}/metrics` | 查询沙箱资源指标 |
+| GET | `/resource-config` | 查看资源默认值 / 软上限 / 绝对护栏（只读） |
+| PUT | `/admin/resource-config` | 运行时调整资源默认值 / 上限（admin token，热生效 + 持久化） |
+| GET | `/admin/console` | 可视化运维 + 资源配置控制台页面（浏览器直接打开） |
 
 ## MCP 接入
 
@@ -388,6 +391,7 @@ docker build -t kerneldock:ci . && trivy image --severity CRITICAL,HIGH --ignore
 | `SANDBOX_POOL__SHARED_STATELESS` | `true` | 无状态执行共享池容器并发 fork（单租户密度更高；多租户置 `false`） |
 | `SANDBOX_QUEUE__MAX_CONCURRENT_EXECUTIONS` | `16` | 执行队列并发闸门（共享租约下 ≈ 池 × 单容器并发） |
 | `SANDBOX_RESOURCE__DEFAULT_CPU` / `DEFAULT_MEMORY_MB` | `1.0` / `512` | 单沙箱默认 CPU / 内存限额 |
+| `SANDBOX_RESOURCE__MAX_CPU` / `MAX_MEMORY_MB` | `2.0` / `2048` | 单沙箱可分配的 CPU / 内存软上限（现已真实生效，超限自动收敛）|
 | `SANDBOX_TIMEOUT__EXECUTION_TIMEOUT` / `SESSION_IDLE_TIMEOUT` | `300` / `600` | 单次执行超时 / 会话空闲超时 |
 | `SANDBOX_KERNEL_TRANSPORT` | `direct` | `direct`=TCP 直连（低延迟）；`relay`=docker exec 中继（物理禁网更保守） |
 | `SANDBOX_NETWORK__EGRESS_MODE` | `none` | `none`=禁网；`proxy`=经白名单代理出站（pip 装包需此模式） |
@@ -395,6 +399,79 @@ docker build -t kerneldock:ci . && trivy image --severity CRITICAL,HIGH --ignore
 | `CORS_ALLOWED_ORIGINS` | 空 | 开发可留空，生产务必收紧 |
 
 经验上，4C8G 机器可以从 `pool_size=2`（弹性上限 4）、`memory=512MB` 起步，再根据真实负载调整。
+
+## 资源配置与分配管理
+
+沙箱资源（CPU / 内存 / 磁盘 / 进程数）采用「三层模型」，既能给单个沙箱按需分配，也能在运行时统一管控上限：
+
+- **默认值（default）**：创建会话沙箱或预热池容器时，未显式指定资源就用这套默认值。
+- **软上限（max）**：单沙箱可分配的上限。请求超过软上限会自动收敛（clamp）到上限，不会报错。
+- **绝对护栏（guardrail）**：无论怎么配置都不可逾越的物理 / 安全天花板，软上限只能在护栏区间内收紧。
+
+> 此前 `SANDBOX_RESOURCE__MAX_*` 配置并未真正参与限制（被硬编码常量覆盖），现已修复为真实生效。磁盘限制依赖底层存储驱动（overlay2 + xfs/quota），当前作为元数据记录与展示；进程数（pids）通过容器 `pids_limit` 生效。
+
+### 1. 为单个会话沙箱分配资源
+
+创建会话时可直接指定该沙箱的资源（仅在 Docker 沙箱模式下生效，超软上限自动收敛）：
+
+```bash
+curl -X POST http://localhost:9527/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"cpu_limit": 2, "memory_limit_mb": 1024, "disk_limit_mb": 2048, "pids_limit": 200}'
+```
+
+响应会回显实际分配（经软上限收敛后）的资源：
+
+```json
+{
+  "session_id": "…",
+  "workspace_dir": "…", "data_dir": "…", "output_dir": "…",
+  "cpu_limit": 2.0, "memory_limit_mb": 1024, "disk_limit_mb": 2048, "pids_limit": 200
+}
+```
+
+### 2. 查看当前资源配置
+
+```bash
+curl http://localhost:9527/resource-config
+```
+
+返回当前默认值、软上限、绝对护栏区间与持久化状态，便于运维查看或 Agent 自适应决定分配多少资源。
+
+### 3. 运行时调整默认值 / 上限（管理端）
+
+无需重启即可调整资源默认值与软上限；变更立即热生效，并持久化到 `$WORKSPACE_DIR/resource_config.json`（重启后仍保留）。需配置并携带 `SANDBOX_ADMIN_TOKEN`：
+
+```bash
+curl -X PUT http://localhost:9527/admin/resource-config \
+  -H "X-Admin-Token: $SANDBOX_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"max_cpu": 3, "max_memory_mb": 3072, "default_memory_mb": 768}'
+```
+
+- 仅传需要修改的字段，省略的保持不变；
+- 超出绝对护栏的值自动收敛，默认值不得超过软上限（超过则下调到上限）；
+- 修改默认值影响「新建」容器；已有预热池容器在老化轮替后采用新值。
+
+### 4. 可视化控制台（推荐）
+
+不想敲 curl？浏览器直接打开内置控制台，像 RabbitMQ Management 那样点选操作：
+
+```
+http://localhost:9527/admin/console
+```
+
+控制台是一个自包含页面（无需单独部署前端），分为四个 Tab：
+
+- **概览**：服务状态、活跃沙箱、容器池可用/总数、CPU/内存占用、运行时长、队列排队/执行中/并发上限（每 5s 自动刷新，可关）。
+- **沙箱**：活跃沙箱列表（资源限额、状态、网络、创建时间），支持一键**销毁**。
+- **队列 & 统计**：`/queue/status` 与 `/statistics` 的完整字段展示。
+- **资源配置**：表格内直接编辑默认值 / 软上限，点「保存配置」即热生效并持久化；超护栏的值自动收敛并在页面提示。
+
+使用说明：
+
+- 顶部填入 **API Key**（若服务启用了 `SANDBOX_API_KEYS`，否则留空）与 **Admin Token**（对应 `SANDBOX_ADMIN_TOKEN`，保存配置/销毁沙箱等写操作必填），凭证仅存浏览器本地 localStorage；
+- 页面本身已在认证中间件中豁免（浏览器可直开），但其调用的数据接口仍受 API Key 保护、写操作另需 admin token。生产环境建议再用反向代理 / 网络策略限制 `/admin/*` 的访问来源。
 
 ## 可观测性
 

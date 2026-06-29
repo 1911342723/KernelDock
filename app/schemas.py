@@ -11,8 +11,16 @@ from pydantic import BaseModel
 
 
 class CreateSessionRequest(BaseModel):
-    """创建会话请求"""
+    """创建会话请求
+
+    资源字段均为可选；提供时对该会话沙箱按需分配，超过软上限会自动收敛（clamp）
+    到上限；省略则使用全局默认值。仅在 Docker 沙箱模式下生效。
+    """
     session_id: Optional[str] = None
+    cpu_limit: Optional[float] = None        # CPU 核心数（支持小数，如 0.5）
+    memory_limit_mb: Optional[int] = None    # 内存限制（MB）
+    disk_limit_mb: Optional[int] = None      # 磁盘限制（MB，作为元数据记录）
+    pids_limit: Optional[int] = None         # 进程数限制
 
 
 class CreateSessionResponse(BaseModel):
@@ -21,6 +29,11 @@ class CreateSessionResponse(BaseModel):
     workspace_dir: str
     data_dir: str
     output_dir: str
+    # 实际分配的资源（经软上限收敛后的真实值；本地回退、无沙箱模式时为 None）
+    cpu_limit: Optional[float] = None
+    memory_limit_mb: Optional[int] = None
+    disk_limit_mb: Optional[int] = None
+    pids_limit: Optional[int] = None
 
 
 class ExecuteCodeRequest(BaseModel):
@@ -239,3 +252,18 @@ class ContextResponse(BaseModel):
     created_at: datetime
     last_used_at: datetime
     parent_context_id: Optional[str] = None
+
+
+class ResourceConfigUpdateRequest(BaseModel):
+    """资源配置更新请求（PUT /admin/resource-config）
+
+    仅传需要修改的字段，省略的保持不变。超出绝对护栏的值会自动收敛(clamp)，
+    默认值不得超过软上限（超过则下调到上限）。
+    """
+    default_cpu: Optional[float] = None        # 默认 CPU 核心数
+    default_memory_mb: Optional[int] = None    # 默认内存（MB）
+    default_disk_mb: Optional[int] = None      # 默认磁盘（MB）
+    default_pids: Optional[int] = None         # 默认进程数
+    max_cpu: Optional[float] = None            # CPU 软上限
+    max_memory_mb: Optional[int] = None        # 内存软上限（MB）
+    max_disk_mb: Optional[int] = None          # 磁盘软上限（MB）

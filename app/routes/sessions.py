@@ -52,13 +52,24 @@ async def create_session(request: CreateSessionRequest):
     sandbox_info = None
     if runtime.sandbox_manager:
         try:
-            sandbox_info = await runtime.sandbox_manager.create_sandbox(session_id=session_id)
+            # 透传 per-沙箱资源分配（超软上限自动收敛，省略则用全局默认值）
+            sandbox_info = await runtime.sandbox_manager.create_sandbox(
+                session_id=session_id,
+                cpu_limit=request.cpu_limit,
+                memory_limit_mb=request.memory_limit_mb,
+                disk_limit_mb=request.disk_limit_mb,
+                pids_limit=request.pids_limit,
+            )
 
             # 更新会话存储中的沙箱 ID
             if runtime.session_store:
                 await runtime.session_store.update_sandbox_id(session_id, sandbox_info.sandbox_id)
 
-            logger.info(f"创建沙箱会话: {session_id}, 沙箱: {sandbox_info.sandbox_id}")
+            logger.info(
+                f"创建沙箱会话: {session_id}, 沙箱: {sandbox_info.sandbox_id}, "
+                f"资源: CPU={sandbox_info.cpu_limit} 内存={sandbox_info.memory_limit_mb}MB "
+                f"磁盘={sandbox_info.disk_limit_mb}MB 进程={sandbox_info.pids_limit}"
+            )
         except Exception as e:
             logger.warning(f"创建沙箱失败，回退到本地模式: {e}")
             sandbox_info = None
@@ -71,7 +82,12 @@ async def create_session(request: CreateSessionRequest):
         session_id=session.session_id,
         workspace_dir=session.workspace_dir,
         data_dir=session.data_dir,
-        output_dir=session.output_dir
+        output_dir=session.output_dir,
+        # 回显经软上限收敛后真正生效的资源（本地回退无沙箱时为 None）
+        cpu_limit=sandbox_info.cpu_limit if sandbox_info else None,
+        memory_limit_mb=sandbox_info.memory_limit_mb if sandbox_info else None,
+        disk_limit_mb=sandbox_info.disk_limit_mb if sandbox_info else None,
+        pids_limit=sandbox_info.pids_limit if sandbox_info else None,
     )
 
 

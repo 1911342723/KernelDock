@@ -17,8 +17,17 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
-# /health 与 /metrics 豁免认证，便于探活与采集。
-_AUTH_EXEMPT_PATHS = {"/health", "/metrics", "/docs", "/openapi.json", "/redoc"}
+# /health 与 /metrics 豁免认证，便于探活与采集；
+# /admin/console 是管理控制台 HTML 页面，浏览器直开无法自动带凭证，故页面本身豁免
+# （页面不含敏感数据，其调用的数据接口仍受 API Key 保护，写操作另需 admin token）。
+_AUTH_EXEMPT_PATHS = {
+    "/health",
+    "/metrics",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+    "/admin/console",
+}
 
 
 def _load_api_keys() -> set:
